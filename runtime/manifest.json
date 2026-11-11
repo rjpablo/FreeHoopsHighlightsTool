@@ -1,0 +1,6 @@
+{
+  "component": "runtime",
+  "version": "1.0",
+  "contents": ["ffmpeg.exe", "ffprobe.exe", "fonts", "licenses"],
+  "ffmpeg": "gyan.dev full build 9.0.2"
+}

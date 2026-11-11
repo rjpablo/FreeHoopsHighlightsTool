@@ -1,0 +1,5 @@
+# torch / torchvision are installed first by install.bat (CUDA build if an NVIDIA GPU is found, else CPU build)
+ultralytics>=8.3
+opencv-python>=4.9
+numpy>=1.26
+pillow>=10.0

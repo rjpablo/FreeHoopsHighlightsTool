@@ -1,0 +1,5 @@
+{
+  "component": "assets",
+  "version": "1.0",
+  "contents": ["intro.mov", "intro_audio.wav", "logo.png", "fonts/", "music/", "calibration/insta360_x4.json"]
+}

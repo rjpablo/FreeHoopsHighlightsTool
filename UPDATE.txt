@@ -1,0 +1,16 @@
+FreeHoops Highlights Tool - how updates work
+============================================
+The program is split into parts with their own version numbers:
+  app\       the Python program        (app\manifest.json)
+  runtime\   FFmpeg and fonts          (runtime\manifest.json)
+  assets\    intro, logo, music, lens calibration (assets\manifest.json)
+  models\    YOLO detection models
+  .venv\     Python libraries (made by install.bat)
+
+Most updates only change app\ and ship as a small zip
+(FreeHoopsHighlightsTool_vX.Y_update.zip). To install one:
+1. Close the program.
+2. Unzip it into the program folder and choose Replace.
+3. Run run.bat as usual.
+If an update needs newer runtime or assets, the program says so and asks for
+the full package. If requirements.txt changed, run install.bat once.

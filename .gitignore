@@ -1,0 +1,29 @@
+# Private Python environment created by install.bat (PyTorch, Ultralytics, OpenCV, ...)
+.venv/
+
+# Bytecode and packaging leftovers
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+
+# Downloaded detection weights (yolov8n/s copies and yolov8m/x fetched on first use)
+models/*.pt
+models/*.part
+*.pt
+
+# Downloaded FFmpeg binaries (gyan.dev) and DejaVu font files
+runtime/ffmpeg.exe
+runtime/ffprobe.exe
+runtime/fonts/*.ttf
+
+# Beats produced by tools/make_music.py (WAV, then encoded to m4a)
+assets/music/*.wav
+assets/music/*.m4a
+
+# Files the program writes while it runs
+output/
+logs/
+work/
+*.log
+FreeHoopsHighlightsTool.settings.json

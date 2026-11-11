@@ -1,0 +1,13 @@
+{
+  "name": "Insta360 X4 factory V3 lens model (fitted on rj's camera, Quoted Cafe 2025-03-07)",
+  "model": "omni_v3",
+  "reference_lens_size": 2880,
+  "fit": [0.5079539234674768, 0.0, 0.0, 0.0, 0.0, -0.023304271563754978, -0.01761512681403825, 0.03400785452369828],
+  "lenses": {
+    "0": {"xi": 1.948170, "fx": 4617.460, "fy": 4617.710, "cx": 4008.510, "cy": 3006.310, "k1": 0.39347404, "k2": 1.26766086, "k3": -3.96793103, "p1": -0.00133719, "p2": -0.00067413},
+    "1": {"xi": 1.948170, "fx": 4606.850, "fy": 4606.460, "cx": 3997.980, "cy": 3013.600, "k1": 0.40390474, "k2": 1.17474365, "k3": -3.72524977, "p1": -0.00013767, "p2": -0.00154557}
+  },
+  "scale_adjust": 1.0,
+  "yaw_offset_deg": 0.0,
+  "notes": "fit = [scale, dcx0, dcy0, dcx1, dcy1, rvec1(3)]. Values are for the 2880 px lens image and are scaled for other lens sizes (e.g. 1920). If seams look doubled, try scale_adjust 0.98-1.02 or switch Lens model to 'generic'."
+}

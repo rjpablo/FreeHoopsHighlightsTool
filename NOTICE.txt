@@ -1,0 +1,10 @@
+Third-party components
+- FFmpeg (runtime\ffmpeg.exe, ffprobe.exe): gyan.dev "full" build, GPL v3. See runtime\licenses.
+- DejaVu fonts (runtime\fonts): DejaVu/Bitstream Vera license.
+- QR Code generator library by Project Nayuki (app\qrcodegen.py): MIT, see app\qrcodegen-LICENSE.txt.
+- Ultralytics YOLOv8 models (models\*.pt, downloaded models): AGPL-3.0, (c) Ultralytics.
+  Installed Python libraries (PyTorch, Ultralytics, OpenCV, NumPy, Pillow) keep their own licenses.
+- Insta360 X4 lens calibration values: read from rj's own camera files.
+- Music in assets\music: original procedurally generated beats made for FreeHoops
+  (no samples or third-party recordings), free to use in FreeHoops videos.
+- Intro animation and logo: FreeHoops brand assets.
