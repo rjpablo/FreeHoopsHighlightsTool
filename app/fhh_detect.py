@@ -315,8 +315,9 @@ def run_analysis(ffmpeg: str, info: SourceInfo, hoops: list[Hoop], st: AnalysisS
     import cv2
     q = QUALITY.get(st.quality, QUALITY["balanced"])
     weights = ensure_weights(q["model"], log)
-    det = Detector(weights, st.threads, log, st.device)
-    cv2.setNumThreads(max(1, st.threads))
+    threads = ctl.thread_count(st.threads)
+    det = Detector(weights, threads, log, st.device)
+    cv2.setNumThreads(threads)
 
     start = max(0.0, st.start)
     end = min(info.duration, st.end) if st.end else info.duration
@@ -341,7 +342,8 @@ def run_analysis(ffmpeg: str, info: SourceInfo, hoops: list[Hoop], st: AnalysisS
 
     prog.begin("Detecting plays")
     fps = q["fps"]
-    reader = FrameReader(ffmpeg, info, start, end - start, plan, ctl, fps=fps, threads=max(1, st.threads // 2))
+    reader = FrameReader(ffmpeg, info, start, end - start, plan, ctl, fps=fps,
+                         threads=max(1, ctl.thread_count(st.threads) // 2))
     persons: list = []
     balls: list = []
     times: list = []
@@ -456,12 +458,13 @@ def scout_hoops(ffmpeg, info, plan, scene, det, q, start, end, st, ctl, prog, lo
     is_flat = info.kind == "flat"
     hoop_model = models_dir() / "hoop.pt"
     span = min(end - start, 360.0)
-    reader = FrameReader(ffmpeg, info, start, span, plan, ctl, fps=2.0, threads=max(1, st.threads // 2))
+    reader = FrameReader(ffmpeg, info, start, span, plan, ctl, fps=2.0,
+                         threads=max(1, ctl.thread_count(st.threads) // 2))
     hoop_det = None
     hoop_classes: list[int] = []
     if hoop_model.is_file():
         try:
-            hoop_det = Detector(hoop_model, st.threads, log, st.device)
+            hoop_det = Detector(hoop_model, ctl.thread_count(st.threads), log, st.device)
             hoop_classes = [int(k) for k, v in hoop_det.names.items() if "hoop" in str(v).lower() or "rim" in str(v).lower()]
             if not hoop_classes:
                 hoop_det = None

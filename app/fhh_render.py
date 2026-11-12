@@ -19,7 +19,9 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from fhh_camera import BASE_HFOV_169, BASE_HFOV_916, FLAT_ZOOM_169, camera_at, plan_clip
+from fhh_camera import (
+    BASE_HFOV_169, BASE_HFOV_916, FLAT_ZOOM_169, animated_zoom, camera_at, plan_clip, zooms_are_flat,
+)
 from fhh_core import (
     JobController, Progress, assets_dir, even, ffmpeg_threads_args, fonts_dir, format_ts,
     popen_kwargs, probe_duration, run_ffmpeg_progress, summarize_ffmpeg, x264_args,
@@ -34,6 +36,7 @@ from graphics import (
 
 INTRO_FALLBACK = 6.8
 CARD_FADE = 0.4
+PREVIEW_CHUNK_S = 60.0
 
 
 @dataclass
@@ -73,6 +76,7 @@ class RenderSettings:
     clip_fade: float = 0.25
     lens_model: str = "x4"
     threads: int = 4
+    preview_chunks: bool = False     # write ~1 min playable parts, then build the final from them
 
 
 def output_size(fmt: str, info: SourceInfo, resolution: str) -> tuple[int, int]:
@@ -106,6 +110,38 @@ def _fallback_keys(clip: Clip, hoops: list[Hoop]) -> list[Keyframe]:
             Keyframe(clip.id, clip.end, yaw, pitch, 1.0, "")]
 
 
+def chunk_closes_before(filled: float, nxt: float, limit: float = PREVIEW_CHUNK_S) -> bool:
+    """True when this clip should start a new preview part.
+
+    A part may run a little past a minute so a short play is not left on its own.
+    A play is never split. One clip longer than a minute is its own part.
+    """
+    if filled <= 0:
+        return False
+    if filled >= limit:
+        return True
+    return filled + nxt > limit * 1.5
+
+
+def concat_copy(ffmpeg: str, parts: list[Path], dest: Path, ctl: JobController) -> None:
+    """Join finished clip files into one playable preview without re-encoding."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    listfile = dest.with_suffix(".txt")
+    listfile.write_text("".join("file '" + p.resolve().as_posix().replace("'", "'\\''") + "'\n" for p in parts),
+                        encoding="utf-8")
+    cmd = [ffmpeg, "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(listfile),
+           "-c", "copy", "-movflags", "+faststart", str(dest)]
+    kw = {k: v for k, v in popen_kwargs(ctl.priority_mode).items() if k == "creationflags"}
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, **kw)
+    finally:
+        listfile.unlink(missing_ok=True)
+    ctl.raise_if_cancelled()
+    if r.returncode != 0 or not dest.is_file():
+        err = r.stderr[-600:] if r.stderr else ""
+        raise RuntimeError(f"Could not write preview {dest.name}:\n{err}")
+
+
 def render_clip_segment(ffmpeg: str, info: SourceInfo, clip: Clip, keys: list[Keyframe],
                         fmt: str, out_w: int, out_h: int, rs: RenderSettings, seg_path: Path,
                         ctl: JobController, on_frame: Callable[[int], None], log: Callable[[str], None]) -> None:
@@ -113,7 +149,8 @@ def render_clip_segment(ffmpeg: str, info: SourceInfo, clip: Clip, keys: list[Ke
     renderer = ClipRenderer(info, plan, rs.lens_model)
     hfov0 = base_hfov(fmt, info)
     dur = clip.duration
-    reader = FrameReader(ffmpeg, info, clip.start, dur, plan, ctl, fps=None, threads=max(1, rs.threads // 2))
+    threads = ctl.thread_count(rs.threads)
+    reader = FrameReader(ffmpeg, info, clip.start, dur, plan, ctl, fps=None, threads=max(1, threads // 2))
     fade = min(rs.clip_fade, dur / 4)
     vf = (f"fade=t=in:st=0:d={fade:.3f},fade=t=out:st={max(0, dur - fade):.3f}:d={fade:.3f},"
           "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p")
@@ -129,7 +166,7 @@ def render_clip_segment(ffmpeg: str, info: SourceInfo, clip: Clip, keys: list[Ke
            "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{out_w}x{out_h}", "-r", info.fps_str, "-i", "-",
            *audio_in,
            "-map", "0:v", "-map", "1:a:0", "-vf", vf, "-af", af,
-           *ffmpeg_threads_args(rs.threads), *x264_args(rs.preset, seg_crf, rs.threads),
+           *ffmpeg_threads_args(threads), *x264_args(rs.preset, seg_crf, threads),
            "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2", "-shortest", str(seg_path)]
     enc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE, **popen_kwargs(ctl.priority_mode))
     ctl.attach(enc)
@@ -138,6 +175,8 @@ def render_clip_segment(ffmpeg: str, info: SourceInfo, clip: Clip, keys: list[Ke
         assert enc.stdin is not None
         for t, frame in reader:
             yaw, pitch, zoom = camera_at(keys, t)
+            if zooms_are_flat(keys):
+                zoom = animated_zoom(t, clip, info.kind == "flat")
             hfov = max(10.0, min(150.0, hfov0 / max(0.5, zoom)))
             view = renderer.view(frame, yaw, pitch, hfov, out_w, out_h)
             try:
@@ -313,8 +352,9 @@ def assemble(ffmpeg: str, ffprobe: str, segs: list[Path], out_path: Path, nomusi
     cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
     for g in inputs:
         cmd += g
-    cmd += [*ffmpeg_threads_args(rs.threads), "-filter_complex", ";".join(f),
-            "-map", "[vout]", "-map", "[aout0]", *x264_args(rs.preset, rs.crf, rs.threads),
+    threads = ctl.thread_count(rs.threads)
+    cmd += [*ffmpeg_threads_args(threads), "-filter_complex", ";".join(f),
+            "-map", "[vout]", "-map", "[aout0]", *x264_args(rs.preset, rs.crf, threads),
             "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
             "-movflags", "+faststart", "-t", f"{total:.3f}", str(out_path)]
     nm_audio = tmp / "nomusic_audio.m4a"
@@ -338,7 +378,7 @@ def render_all(ffmpeg: str, ffprobe: str, info: SourceInfo, clips: list[Clip],
                detections: Optional[Detections], out_path: Path, rs: RenderSettings,
                work: Path, ctl: JobController, prog: Progress, log: Callable[[str], None]) -> list[Path]:
     import cv2
-    cv2.setNumThreads(max(1, rs.threads))
+    cv2.setNumThreads(ctl.thread_count(rs.threads))
     if not clips:
         raise ValueError("No clips are switched on. Include at least one clip.")
     by_clip: dict[str, list[Keyframe]] = {}
@@ -358,15 +398,37 @@ def render_all(ffmpeg: str, ffprobe: str, info: SourceInfo, clips: list[Clip],
         tmp.mkdir(parents=True, exist_ok=True)
         log(f"Rendering {fmt} at {out_w}x{out_h}: {len(clips)} clips, "
             f"{sum(c.duration for c in clips):.0f} s of footage")
+        log("Zoom eases in toward the basket, then back out (about 1.8x at most).")
         prog.begin(f"Rendering clips ({fmt})")
         segs: list[Path] = []
+        chunk_dir: Optional[Path] = None
+        chunk_parts: list[Path] = []
+        chunk_paths: list[Path] = []
+        chunk_dur = 0.0
+        if rs.preview_chunks:
+            chunk_dir = out_path.parent / f"{out_path.stem}_chunks" / ("16x9" if fmt == "16:9" else "9x16")
+            shutil.rmtree(chunk_dir, ignore_errors=True)
+            chunk_dir.mkdir(parents=True, exist_ok=True)
+            log(f"Preview parts folder: {chunk_dir.parent}")
+
+        def flush_chunk() -> None:
+            nonlocal chunk_dur
+            if not chunk_parts or chunk_dir is None:
+                return
+            part = chunk_dir / f"part_{len(chunk_paths) + 1:02d}.mp4"
+            concat_copy(ffmpeg, list(chunk_parts), part, ctl)
+            chunk_paths.append(part)
+            log(f"Preview part {len(chunk_paths)} ready ({chunk_dur:.0f} s): {part}")
+            chunk_parts.clear()
+            chunk_dur = 0.0
+
         hf = base_hfov(fmt, info)
         done = 0
         for n, c in enumerate(clips, 1):
             ks = by_clip.get(c.id)
             if not ks:
                 if detections is not None:
-                    ks, _ = plan_clip(c, detections, hoops, bystanders, hf)
+                    ks, _ = plan_clip(c, detections, hoops, bystanders, hf, flat=info.kind == "flat")
                     log(f"Clip {c.id}: no camera keyframes in the CSV, planned them automatically.")
                 else:
                     ks = _fallback_keys(c, hoops)
@@ -380,8 +442,22 @@ def render_all(ffmpeg: str, ffprobe: str, info: SourceInfo, clips: list[Clip],
             render_clip_segment(ffmpeg, info, c, ks, fmt, out_w, out_h, rs, seg, ctl, on_frame, log)
             done += int(c.duration * info.fps)
             segs.append(seg)
+            if rs.preview_chunks:
+                if chunk_closes_before(chunk_dur, c.duration):
+                    flush_chunk()
+                chunk_parts.append(seg)
+                chunk_dur += c.duration
+                if chunk_dur >= PREVIEW_CHUNK_S:
+                    flush_chunk()
+        if rs.preview_chunks:
+            flush_chunk()
+            if not chunk_paths:
+                raise RuntimeError("No preview parts were written.")
+            log(f"Building the final video from {len(chunk_paths)} preview part"
+                f"{'s' if len(chunk_paths) != 1 else ''}.")
         prog.begin(f"Assembling ({fmt})")
-        assemble(ffmpeg, ffprobe, segs, dest, nm, out_w, out_h, info.fps_str, rs, tmp, ctl, prog, log)
+        assemble(ffmpeg, ffprobe, chunk_paths if rs.preview_chunks else segs, dest, nm,
+                 out_w, out_h, info.fps_str, rs, tmp, ctl, prog, log)
         outputs.append(dest)
         if nm:
             outputs.append(nm)

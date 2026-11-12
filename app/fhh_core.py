@@ -23,7 +23,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
-VERSION = "1.0"
+VERSION = "1.1"
 APP_NAME = "FreeHoops Highlights Tool"
 SETTINGS_NAME = "FreeHoopsHighlightsTool.settings.json"
 APP_REQUIRES_RUNTIME = "1.0"
@@ -977,6 +977,26 @@ def set_own_priority(mode: str) -> None:
         pass
 
 
+def apply_library_threads(threads: int) -> None:
+    """Limit OpenCV and PyTorch threads. Safe to call again while a job is running."""
+    n = max(1, int(threads))
+    try:
+        import cv2
+        cv2.setNumThreads(n)
+    except Exception:
+        pass
+    try:
+        import torch
+        torch.set_num_threads(n)
+    except Exception:
+        pass
+    try:
+        from threadpoolctl import threadpool_limits
+        threadpool_limits(limits=n)
+    except Exception:
+        pass
+
+
 def popen_kwargs(priority_mode: str, text: bool = False) -> dict:
     kw: dict = {}
     if sys.platform == "win32":
@@ -1009,6 +1029,7 @@ class JobController:
         self.paused_total = 0.0
         self.run_started: float | None = None
         self.priority_mode = "balanced"
+        self.threads = resolve_threads("balanced")
 
     def reset(self) -> None:
         with self._lock:
@@ -1047,6 +1068,28 @@ class JobController:
                 apply_process_priority(p.pid, mode)
             except Exception:
                 pass
+
+    def set_performance(self, mode: str, threads: int) -> None:
+        """Priority applies to this process and FFmpeg immediately.
+
+        Thread count applies to detection immediately. An encoder that is
+        already running keeps its thread count; the next clip or assembly uses
+        the new one.
+        """
+        try:
+            threads = int(threads)
+        except (TypeError, ValueError):
+            threads = 1
+        self.threads = max(1, threads)
+        self.set_priority(mode)
+        apply_library_threads(self.threads)
+
+    def thread_count(self, fallback: int | None = None) -> int:
+        try:
+            n = int(self.threads if self.threads else (fallback or 1))
+        except (TypeError, ValueError):
+            n = int(fallback or 1)
+        return max(1, n)
 
     def request_cancel(self) -> None:
         self._cancel.set()

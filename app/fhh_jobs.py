@@ -11,8 +11,8 @@ from typing import Callable, Optional
 
 from fhh_camera import BASE_HFOV_169, FLAT_ZOOM_169, estimate_release, filter_bystanders, plan_clip
 from fhh_core import (
-    VERSION, JobController, Progress, ProgressCb, assets_dir, find_tool, format_ts,
-    output_stem_for, resolve_threads, set_own_priority, work_root,
+    VERSION, PERF_LABELS, JobController, Progress, ProgressCb, assets_dir, find_tool,
+    format_ts, output_stem_for, priority_name, resolve_threads, work_root,
 )
 from fhh_detect import AnalysisSettings, Detections, Hoop, detect_events, run_analysis, warmup_end
 from fhh_project import (
@@ -85,12 +85,20 @@ def work_dir_for(output_path: Path) -> Path:
     return d
 
 
+def _use_performance(job: Job, ctl: JobController, log: Callable[[str], None]) -> None:
+    """Set priority and thread count. The window can change both while a run continues."""
+    threads = resolve_threads(job.perf_mode, job.perf_threads)
+    ctl.set_performance(job.perf_mode, threads)
+    label = PERF_LABELS.get(job.perf_mode, job.perf_mode)
+    log(f"Performance: {label} ({threads} threads, {priority_name(job.perf_mode)} priority). "
+        "You can change this while it runs.")
+
+
 def analyze(job: Job, ctl: JobController, progress: ProgressCb, log: Callable[[str], None]) -> dict:
     ffmpeg, ffprobe = _tools()
     _check_paths(job)
     threads = resolve_threads(job.perf_mode, job.perf_threads)
-    ctl.priority_mode = job.perf_mode
-    set_own_priority(job.perf_mode)
+    _use_performance(job, ctl, log)
     info = detect_source(job.input_path, ffmpeg, ffprobe, job.source_kind)
     log(f"Input: {info.describe()}")
     for n in info.notes:
@@ -130,7 +138,7 @@ def analyze(job: Job, ctl: JobController, progress: ProgressCb, log: Callable[[s
     hf = FLAT_HFOV / FLAT_ZOOM_169 if info.kind == "flat" else BASE_HFOV_169
     keys = []
     for c in clips:
-        ks, rel = plan_clip(c, d, hoops, by, hf)
+        ks, rel = plan_clip(c, d, hoops, by, hf, flat=info.kind == "flat")
         c.release = rel
         keys.extend(ks)
     paths = data_paths(job.output_path)
@@ -175,8 +183,7 @@ def render(job: Job, clips_csv: Path, ctl: JobController, progress: ProgressCb,
             raise FileExistsError("Output already exists: " + ", ".join(t.name for t in taken)
                                   + ". Choose another name or allow overwriting.")
     threads = resolve_threads(job.perf_mode, job.perf_threads)
-    ctl.priority_mode = job.perf_mode
-    set_own_priority(job.perf_mode)
+    _use_performance(job, ctl, log)
     job.render.threads = threads
     job.render.lens_model = job.lens_model
     info = detect_source(Path(src), ffmpeg, ffprobe, proj.kind if proj and job.source_kind == "auto" else job.source_kind)

@@ -13,9 +13,9 @@ from typing import Optional
 from fhh_core import (
     APP_NAME, DEFAULT_PERF_MODE, PERF_LABELS, PERF_MODES, VERSION, X264_PRESETS,
     JobController, ProgressInfo, RenderCancelled, RunLogger, default_output_dir, find_tool,
-    format_eta, format_time, format_ts, load_settings, logs_dir, open_folder,
-    parse_optional_time, parse_time, resolve_threads, save_settings, saved_output_dir, unique_name,
-    output_stem_for,
+    format_eta, format_time, format_ts, load_settings, logs_dir, open_folder, output_stem_for,
+    parse_optional_time, parse_time, priority_name, resolve_threads, save_settings,
+    saved_output_dir, unique_name,
 )
 from fhh_detect import QUALITY, QUALITY_LABELS, Hoop, estimate_rim_width
 from fhh_jobs import Job, analyze, default_title, music_tracks, render
@@ -74,8 +74,12 @@ class App:
         self.v_input = V()
         self.v_outdir = V(value=str(saved_output_dir(s)))
         self.v_outname = V()
-        self.v_start = V(value="")
-        self.v_end = V(value="")
+        self.v_start_s = tk.DoubleVar(value=0.0)
+        self.v_end_s = tk.DoubleVar(value=0.0)
+        self.v_start_lab = V(value="—")
+        self.v_end_lab = V(value="—")
+        self._range_dur = 0.0
+        self._range_sync = False
         self.v_srcinfo = V(value="Pick an .insv, 360 MP4, or game video.")
         self.v_quality = V(value=QUALITY_LABELS.get(s.get("quality", "balanced"), QUALITY_LABELS["balanced"]))
         self.v_sens = tk.DoubleVar(value=float(s.get("sensitivity", 0.5)))
@@ -100,6 +104,8 @@ class App:
         self.v_music = V(value=s.get("music_label", ""))
         self.music_custom = s.get("music_custom", "")
         self.v_nomusic = B(value=bool(s.get("nomusic_copy", True)))
+        self.v_chunks = B(value=bool(s.get("preview_chunks", False)))
+        self.preview_dir: Optional[Path] = None
         self.v_lt_on = B(value=bool(s.get("lt_on", True)))
         self.v_lt1 = V(value=s.get("lt_line1", LT_TITLE))
         self.v_lt2 = V(value=s.get("lt_line2", LT_SUB))
@@ -114,6 +120,8 @@ class App:
         pm = s.get("perf_mode", DEFAULT_PERF_MODE)
         self.v_perf = V(value=PERF_LABELS.get(pm, "Balanced"))
         self.v_threads = V(value=str(s.get("perf_threads") or resolve_threads(pm)))
+        self.v_autorender = B(value=bool(s.get("auto_render", False)))
+        self._perf_sync = False
         self.v_status = V(value="Ready.")
         self.v_pct = V(value="0%")
         self.v_timing = V(value="Elapsed --   ETA --")
@@ -124,6 +132,7 @@ class App:
             self._add_lt_row(w.get("start", ""), w.get("duration", "6"))
         self._refresh_music_choices()
         self._update_hoop_label()
+        self._sync_analyze_button()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.after(100, self._poll)
 
@@ -168,24 +177,28 @@ class App:
         lock(ttk.Button(f1, text="Browse...", command=self.browse_input)).grid(row=0, column=4, **P)
         ttk.Label(f1, textvariable=self.v_srcinfo, foreground="#555").grid(row=1, column=1, columnspan=4, sticky="w", padx=6)
         ttk.Label(f1, text="Start").grid(row=2, column=0, sticky="w", **P)
-        rng = ttk.Frame(f1)
-        rng.grid(row=2, column=1, columnspan=4, sticky="w")
-        lock(ttk.Entry(rng, textvariable=self.v_start, width=10)).pack(side="left", padx=6)
-        ttk.Label(rng, text="End").pack(side="left", padx=(12, 4))
-        lock(ttk.Entry(rng, textvariable=self.v_end, width=10)).pack(side="left", padx=6)
-        ttk.Label(rng, text="hh:mm:ss or mm:ss, blank = whole video. Only this part is analyzed (handy to skip warm-ups).",
-                  foreground="#555").pack(side="left", padx=8)
-        ttk.Label(f1, text="Output folder").grid(row=3, column=0, sticky="w", **P)
-        lock(ttk.Entry(f1, textvariable=self.v_outdir)).grid(row=3, column=1, sticky="ew", **P)
-        lock(ttk.Button(f1, text="Browse...", command=self.browse_outdir)).grid(row=3, column=2, **P)
-        ttk.Button(f1, text="Open folder", command=self.open_outdir).grid(row=3, column=3, **P)
-        lock(ttk.Button(f1, text="Reset", command=self.reset_outdir)).grid(row=3, column=4, **P)
-        ttk.Label(f1, text="File name").grid(row=4, column=0, sticky="w", **P)
+        self.start_scale = ttk.Scale(f1, from_=0, to=1, variable=self.v_start_s, command=lambda v: self.on_range_scale("start"))
+        self.start_scale.grid(row=2, column=1, columnspan=3, sticky="ew", padx=6, pady=3)
+        self.start_scale.state(["disabled"])
+        ttk.Label(f1, textvariable=self.v_start_lab, width=8).grid(row=2, column=4, sticky="w")
+        ttk.Label(f1, text="End").grid(row=3, column=0, sticky="w", **P)
+        self.end_scale = ttk.Scale(f1, from_=0, to=1, variable=self.v_end_s, command=lambda v: self.on_range_scale("end"))
+        self.end_scale.grid(row=3, column=1, columnspan=3, sticky="ew", padx=6, pady=3)
+        self.end_scale.state(["disabled"])
+        ttk.Label(f1, textvariable=self.v_end_lab, width=8).grid(row=3, column=4, sticky="w")
+        ttk.Label(f1, text="Drag to use part of the video. Both ends at the limits means the whole file.",
+                  foreground="#555").grid(row=4, column=1, columnspan=4, sticky="w", padx=6)
+        ttk.Label(f1, text="Output folder").grid(row=5, column=0, sticky="w", **P)
+        lock(ttk.Entry(f1, textvariable=self.v_outdir)).grid(row=5, column=1, sticky="ew", **P)
+        lock(ttk.Button(f1, text="Browse...", command=self.browse_outdir)).grid(row=5, column=2, **P)
+        ttk.Button(f1, text="Open folder", command=self.open_outdir).grid(row=5, column=3, **P)
+        lock(ttk.Button(f1, text="Reset", command=self.reset_outdir)).grid(row=5, column=4, **P)
+        ttk.Label(f1, text="File name").grid(row=6, column=0, sticky="w", **P)
         e = lock(ttk.Entry(f1, textvariable=self.v_outname))
-        e.grid(row=4, column=1, sticky="ew", **P)
+        e.grid(row=6, column=1, sticky="ew", **P)
         e.bind("<Key>", lambda _e: setattr(self, "name_locked", True))
         ttk.Label(f1, text="CSV files are saved next to the video with the same name.", foreground="#555").grid(
-            row=4, column=2, columnspan=3, sticky="w", padx=6)
+            row=6, column=2, columnspan=3, sticky="w", padx=6)
         self.v_input.trace_add("write", lambda *_: self.on_input_changed())
         self.v_outdir.trace_add("write", lambda *_: self.refresh_name())
 
@@ -232,6 +245,12 @@ class App:
         lock(ttk.Button(bf, text="Load clip list...", command=self.load_csv)).pack(side="left", padx=6)
         ttk.Label(bf, text="No GPU? Detection runs on the CPU and can take longer than the video. 'Fast' is quickest.",
                   foreground="#555").pack(side="left", padx=8)
+        af = ttk.Frame(f2)
+        af.grid(row=6, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        lock(ttk.Checkbutton(af, text="Render the video automatically when highlights are found",
+                             variable=self.v_autorender, command=self._sync_analyze_button)).pack(side="left", padx=6)
+        ttk.Label(af, text="Uses the format, intro, logo, and music in section 4.",
+                  foreground="#555").pack(side="left", padx=4)
 
         # --- 3. Clips
         f3 = ttk.LabelFrame(frm, text="3. Review clips (double-click to edit; changes are saved to the CSV)", padding=8)
@@ -329,22 +348,31 @@ class App:
             ttk.Label(ef, text=lab).grid(row=i, column=0, sticky="w")
             lock(ttk.Entry(ef, textvariable=var)).grid(row=i, column=1, sticky="ew", padx=4, pady=1)
         r += 1
-        pfm = ttk.Frame(f4)
-        pfm.grid(row=r, column=0, columnspan=4, sticky="w", pady=4)
-        ttk.Label(pfm, text="Performance").pack(side="left", padx=6)
-        cbp = ttk.Combobox(pfm, textvariable=self.v_perf, values=[PERF_LABELS[m] for m in PERF_MODES],
-                           state="readonly", width=11)
-        cbp.pack(side="left", padx=4)
-        cbp.bind("<<ComboboxSelected>>", lambda e: self.on_perf_changed())
-        ttk.Label(pfm, text="threads").pack(side="left")
-        lock(ttk.Spinbox(pfm, from_=1, to=max(1, os.cpu_count() or 1), textvariable=self.v_threads, width=4)).pack(side="left", padx=4)
-        ttk.Label(pfm, text="Full = all cores; Balanced = half, lower priority; Background = quarter, idle priority",
-                  foreground="#555").pack(side="left", padx=6)
+        lock(ttk.Checkbutton(f4, text="Save 1-minute preview parts, then build the final video from them",
+                             variable=self.v_chunks)).grid(row=r, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 0))
+        r += 1
+        ttk.Label(f4, text="Each part is about one minute of the reframed clips. You can play a part as soon as it is written. A play is kept whole.",
+                  foreground="#555").grid(row=r, column=0, columnspan=4, sticky="w", padx=6)
         r += 1
         self.btn_render = lock(ttk.Button(f4, text="Render highlights", command=self.start_render))
         self.btn_render.grid(row=r, column=0, sticky="w", padx=6, pady=(6, 2))
 
-        # --- footer: progress + log
+        # --- footer: performance (stays enabled during a run), progress + log
+        pfm = ttk.Frame(footer)
+        pfm.pack(fill="x", pady=(0, 4))
+        ttk.Label(pfm, text="Performance").pack(side="left")
+        cbp = ttk.Combobox(pfm, textvariable=self.v_perf, values=[PERF_LABELS[m] for m in PERF_MODES],
+                           state="readonly", width=12)
+        cbp.pack(side="left", padx=(6, 4))
+        cbp.bind("<<ComboboxSelected>>", lambda e: self.on_perf_changed())
+        ttk.Label(pfm, text="threads").pack(side="left")
+        threads = ttk.Spinbox(pfm, from_=1, to=max(1, os.cpu_count() or 1), textvariable=self.v_threads,
+                              width=4, command=self.on_threads_edited)
+        threads.pack(side="left", padx=4)
+        threads.bind("<Return>", lambda e: self.on_threads_edited())
+        threads.bind("<FocusOut>", lambda e: self.on_threads_edited())
+        ttk.Label(pfm, text="You can change this while processing. Priority applies at once; fewer threads apply to detection at once and to encoding on the next clip.",
+                  foreground="#555").pack(side="left", padx=6)
         pr = ttk.Frame(footer)
         pr.pack(fill="x")
         ttk.Progressbar(pr, variable=self.v_prog, maximum=1.0).pack(side="left", fill="x", expand=True, padx=(0, 8))
@@ -367,6 +395,10 @@ class App:
         lbb = ttk.Frame(footer)
         lbb.pack(fill="x")
         ttk.Button(lbb, text="Open logs folder", command=lambda: self._safe(open_folder, logs_dir())).pack(side="left", pady=2)
+        self.btn_open_out = ttk.Button(lbb, text="Open output folder", command=self.open_outdir, state="disabled")
+        self.btn_open_out.pack(side="left", padx=8, pady=2)
+        self.btn_open_preview = ttk.Button(lbb, text="Open preview parts", command=self.open_preview_dir, state="disabled")
+        self.btn_open_preview.pack(side="left", padx=4, pady=2)
 
     # ------------------------------------------------------------------ helpers
     def _safe(self, fn, *a):
@@ -410,6 +442,7 @@ class App:
         self.refresh_name()
         p = Path(self.v_input.get().strip().strip('"'))
         if not p.is_file():
+            self._set_range_duration(0)
             return
         if not self.title_edited:
             self.v_title.set(default_title(None, p))
@@ -417,7 +450,71 @@ class App:
             self.hoops = []
             self._update_hoop_label()
         self.v_srcinfo.set("Reading video...")
+        self._set_range_duration(0)
         threading.Thread(target=self._probe_bg, args=(p,), daemon=True).start()
+
+    def _set_range_duration(self, dur: float):
+        """Slider max is this file's length. 0 disables the sliders until a video is read."""
+        dur = max(0.0, float(dur or 0))
+        self._range_dur = dur
+        self._range_sync = True
+        try:
+            if dur <= 2:
+                self.start_scale.state(["disabled"])
+                self.end_scale.state(["disabled"])
+                self.v_start_s.set(0)
+                self.v_end_s.set(0)
+                self.v_start_lab.set("—")
+                self.v_end_lab.set("—")
+                return
+            self.start_scale.configure(from_=0, to=dur)
+            self.end_scale.configure(from_=0, to=dur)
+            self.start_scale.state(["!disabled"])
+            self.end_scale.state(["!disabled"])
+            self.v_start_s.set(0)
+            self.v_end_s.set(dur)
+            self.v_start_lab.set(format_time(0))
+            self.v_end_lab.set(format_time(dur))
+        finally:
+            self._range_sync = False
+
+    def on_range_scale(self, which: str):
+        if self._range_sync or self._range_dur <= 2:
+            return
+        dur = self._range_dur
+        start = min(dur, max(0.0, round(float(self.v_start_s.get()))))
+        end = min(dur, max(0.0, round(float(self.v_end_s.get()))))
+        if end < start + 2:
+            if which == "start":
+                end = min(dur, start + 2)
+                if end - start < 2:
+                    start = max(0.0, end - 2)
+            else:
+                start = max(0.0, end - 2)
+                if end - start < 2:
+                    end = min(dur, start + 2)
+        self._range_sync = True
+        try:
+            if abs(float(self.v_start_s.get()) - start) > 0.01:
+                self.v_start_s.set(start)
+            if abs(float(self.v_end_s.get()) - end) > 0.01:
+                self.v_end_s.set(end)
+        finally:
+            self._range_sync = False
+        self.v_start_lab.set(format_time(start))
+        self.v_end_lab.set(format_time(end))
+
+    def range_start(self) -> Optional[float]:
+        if self._range_dur <= 2:
+            return None
+        start = float(self.v_start_s.get())
+        return start if start > 0.5 else None
+
+    def range_end(self) -> Optional[float]:
+        if self._range_dur <= 2:
+            return None
+        end = float(self.v_end_s.get())
+        return end if end < self._range_dur - 0.5 else None
 
     def _probe_bg(self, p: Path):
         try:
@@ -445,6 +542,10 @@ class App:
 
     def open_outdir(self):
         self._safe(open_folder, self.current_outdir())
+
+    def open_preview_dir(self):
+        if self.preview_dir is not None:
+            self._safe(open_folder, self.preview_dir)
 
     def _persist_outdir(self):
         data = load_settings()
@@ -513,13 +614,61 @@ class App:
         label = self.v_perf.get()
         return next((m for m, l in PERF_LABELS.items() if l == label), DEFAULT_PERF_MODE)
 
-    def on_perf_changed(self):
+    def _sync_analyze_button(self):
+        if getattr(self, "btn_analyze", None) is None:
+            return
+        self.btn_analyze.configure(text="Find and render" if self.v_autorender.get() else "Find highlights")
+
+    def _chosen_threads(self) -> tuple[str, int]:
         mode = self.perf_mode()
         if mode != "custom":
-            self.v_threads.set(str(resolve_threads(mode)))
-        if self.ctl is not None and self.worker is not None and self.worker.is_alive():
-            self.ctl.set_priority(mode)
-            self.log(f"Performance changed to {PERF_LABELS[mode]} (priority now; thread count applies next run).")
+            return mode, resolve_threads(mode)
+        try:
+            n = int(float(self.v_threads.get()))
+        except (TypeError, ValueError):
+            n = 1
+        return mode, resolve_threads("custom", n)
+
+    def on_perf_changed(self):
+        if self._perf_sync:
+            return
+        mode = self.perf_mode()
+        if mode != "custom":
+            self._perf_sync = True
+            try:
+                self.v_threads.set(str(resolve_threads(mode)))
+            finally:
+                self._perf_sync = False
+        self._push_performance()
+
+    def on_threads_edited(self):
+        if self._perf_sync:
+            return
+        mode = self.perf_mode()
+        try:
+            n = int(float(self.v_threads.get()))
+        except (TypeError, ValueError):
+            return
+        if mode != "custom" and n == resolve_threads(mode):
+            return
+        if mode != "custom":
+            self._perf_sync = True
+            try:
+                self.v_perf.set(PERF_LABELS["custom"])
+            finally:
+                self._perf_sync = False
+        self._push_performance()
+
+    def _push_performance(self):
+        mode, threads = self._chosen_threads()
+        running = self.ctl is not None and self.worker is not None and self.worker.is_alive()
+        if running:
+            self.ctl.set_performance(mode, threads)
+            self.log(f"Performance: {PERF_LABELS[mode]} ({threads} threads, {priority_name(mode)} priority).")
+        try:
+            self.save_ui_settings()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ clips table
     def show_clips(self):
@@ -698,8 +847,8 @@ class App:
         inp = Path(self.v_input.get().strip().strip('"'))
         if not inp.is_file():
             raise ValueError("Choose an input video.")
-        start = parse_optional_time(self.v_start.get())
-        end = parse_optional_time(self.v_end.get())
+        start = self.range_start()
+        end = self.range_end()
         if start is not None and end is not None and end <= start:
             raise ValueError("End time must be after the start time.")
         quality = next((k for k, v in QUALITY_LABELS.items() if v == self.v_quality.get()), "balanced")
@@ -737,6 +886,7 @@ class App:
         rs.end_duration = float(self.v_end_dur.get() or 7)
         rs.end_title, rs.end_sub = self.v_end1.get(), self.v_end2.get()
         rs.qr_caption, rs.qr_url = self.v_qrcap.get(), self.v_qrurl.get()
+        rs.preview_chunks = bool(self.v_chunks.get())
         job.render = rs
         return job
 
@@ -756,7 +906,9 @@ class App:
             end_on=self.v_end_on.get(), end_mode=self.v_end_mode.get(), end_start=self.v_end_start.get(),
             end_duration=self.v_end_dur.get(), end_title=self.v_end1.get(), end_sub=self.v_end2.get(),
             qr_caption=self.v_qrcap.get(), qr_url=self.v_qrurl.get(), perf_mode=self.perf_mode(),
-            perf_threads=self.v_threads.get(), output_dir=str(self.current_outdir()),
+            perf_threads=self.v_threads.get(), auto_render=self.v_autorender.get(),
+            preview_chunks=self.v_chunks.get(),
+            output_dir=str(self.current_outdir()),
             hoops=[h.to_dict() for h in self.hoops],
             hoops_input=str(Path(self.v_input.get().strip().strip('"')).parent) if self.hoops else "",
         ))
@@ -810,8 +962,50 @@ class App:
         csvp = data_paths(job.output_path)["clips"]
         if csvp.exists() and not self.mb.askyesno(APP_NAME, f"{csvp.name} already exists. Replace it?"):
             return
+        auto = bool(self.v_autorender.get())
+        if auto:
+            if not job.render.formats:
+                self.mb.showerror(APP_NAME, "Tick at least one format (16:9 or 9:16) in section 4.")
+                return
+            taken = [p for p in self._output_files(job) if p.exists()]
+            if taken and not self.mb.askyesno(APP_NAME, "Replace " + ", ".join(p.name for p in taken) + "?"):
+                return
+            if taken:
+                job.overwrite = True
+            self.v_status.set("Finding highlights, then rendering...")
+            self._start("auto", lambda ctl, prog, log: self._analyze_then_render(job, ctl, prog, log))
+            return
         self.v_status.set("Finding highlights...")
         self._start("analyze", lambda ctl, prog, log: analyze(job, ctl, prog, log))
+
+    def _output_files(self, job: Job) -> list[Path]:
+        outs = []
+        if "16:9" in job.render.formats:
+            outs.append(job.output_path)
+        if "9:16" in job.render.formats:
+            outs.append(job.output_path.with_name(job.output_path.stem + "_short" + job.output_path.suffix))
+        return outs
+
+    def _analyze_then_render(self, job: Job, ctl: JobController, prog, log):
+        res = analyze(job, ctl, prog, log)
+        self.q.put(("clips", res))
+        if not any(c.include for c in res["clips"]):
+            log("No clips are switched on, so the video was not rendered.")
+            return {"analyze": res, "outputs": []}
+        log("Highlights found. Rendering them now.")
+        self.q.put(("phase", "Rendering highlights..."))
+        job.perf_mode = ctl.priority_mode or job.perf_mode
+        job.perf_threads = ctl.threads if ctl.priority_mode == "custom" else None
+        ctl.reset()
+        outputs = render(job, res["paths"]["clips"], ctl, prog, log)
+        return {"analyze": res, "outputs": outputs}
+
+    def _show_found(self, res: dict):
+        self.data_path = res["paths"]["clips"]
+        self.clips = res["clips"]
+        self.hoops = res["project"].hoops
+        self._update_hoop_label()
+        self.show_clips()
 
     def start_render(self):
         if self.data_path is None:
@@ -826,12 +1020,7 @@ class App:
             self.mb.showerror(APP_NAME, "Tick at least one format (16:9 or 9:16).")
             return
         job.output_path = self.data_path.with_suffix(".mp4")
-        outs = []
-        if "16:9" in job.render.formats:
-            outs.append(job.output_path)
-        if "9:16" in job.render.formats:
-            outs.append(job.output_path.with_name(job.output_path.stem + "_short.mp4"))
-        taken = [o for o in outs if o.exists()]
+        taken = [o for o in self._output_files(job) if o.exists()]
         if taken:
             if not self.mb.askyesno(APP_NAME, "Replace " + ", ".join(o.name for o in taken) + "?"):
                 return
@@ -872,6 +1061,9 @@ class App:
                 kind, val = self.q.get_nowait()
                 if kind == "log":
                     self._append_log(val)
+                    if val.startswith("Preview part ") and ": " in val:
+                        self.preview_dir = Path(val.split(": ", 1)[1].strip()).parent
+                        self.btn_open_preview.configure(state="normal")
                 elif kind == "progress":
                     info: ProgressInfo = val
                     self.v_prog.set(info.fraction)
@@ -883,26 +1075,40 @@ class App:
                     if Path(self.v_input.get().strip().strip('"')) == p:
                         self.info = info
                         self.v_srcinfo.set(info.describe())
+                        self._set_range_duration(info.duration)
                         if not self.title_edited:
                             self.v_title.set(default_title(info, p))
                 elif kind == "info_err":
                     self.info = None
                     self.v_srcinfo.set("Could not read this video: " + val)
+                    self._set_range_duration(0)
+                elif kind == "phase":
+                    self.btn_pause.configure(text="Pause")
+                    self.v_status.set(val)
+                elif kind == "clips":
+                    self._show_found(val)
                 elif kind == "done":
                     what, res = val
                     self.set_busy(False)
                     self.v_prog.set(1.0)
                     self.v_pct.set("100%")
                     if what == "analyze":
-                        self.data_path = res["paths"]["clips"]
-                        self.clips = res["clips"]
-                        self.hoops = res["project"].hoops
-                        self._update_hoop_label()
-                        self.show_clips()
+                        self._show_found(res)
                         self.v_status.set("Done. Review the clips, then Render.")
                         self.save_ui_settings()
+                    elif what == "auto":
+                        self._show_found(res["analyze"])
+                        self.save_ui_settings()
+                        if res["outputs"]:
+                            self.v_status.set("Done: " + ", ".join(Path(p).name for p in res["outputs"]))
+                            self.btn_open_out.configure(state="normal")
+                            self.mb.showinfo(APP_NAME, "Finished:\n" + "\n".join(str(p) for p in res["outputs"]))
+                        else:
+                            self.v_status.set("Highlights found, but none are switched on. Nothing was rendered.")
+                            self.mb.showinfo(APP_NAME, "Highlights were found, but every clip is switched off, so no video was rendered.")
                     else:
                         self.v_status.set("Done: " + ", ".join(Path(p).name for p in res))
+                        self.btn_open_out.configure(state="normal")
                         self.mb.showinfo(APP_NAME, "Finished:\n" + "\n".join(str(p) for p in res))
                 elif kind == "cancelled":
                     self.set_busy(False)
@@ -952,7 +1158,7 @@ class HoopPicker:
         bar = ttk.Frame(self.top, padding=6)
         bar.pack(fill="x")
         ttk.Label(bar, text="Frame at").pack(side="left")
-        start = parse_optional_time(app.v_start.get()) or 0.0
+        start = app.range_start() or 0.0
         self.v_t = tk.StringVar(value=format_ts(min(info.duration - 1, start + 30)))
         ttk.Entry(bar, textvariable=self.v_t, width=10).pack(side="left", padx=4)
         ttk.Button(bar, text="Load frame", command=self.load).pack(side="left", padx=4)
@@ -1141,7 +1347,7 @@ class ClipPreview:
 
     def show(self):
         from PIL import Image, ImageTk
-        from fhh_camera import camera_at
+        from fhh_camera import animated_zoom, camera_at, zooms_are_flat
         from fhh_render import _fallback_keys, base_hfov
         from fhh_source import ClipRenderer, base_filter, decode_plan, grab_frame_raw
         self.top.configure(cursor="watch")
@@ -1159,6 +1365,8 @@ class ClipPreview:
             files = info.files if info.kind == "split" else info.files[:1]
             frame = grab_frame_raw(find_tool("ffmpeg"), files, t, base_filter(info), plan.width, plan.height)
             yaw, pitch, zoom = camera_at(keys, t)
+            if zooms_are_flat(keys):
+                zoom = animated_zoom(t, self.clip, info.kind == "flat")
             fmt = self.v_fmt.get()
             w, h = (960, 540) if fmt == "16:9" else (304, 540)
             view = ClipRenderer(info, plan, self.app.v_lens.get()).view(

@@ -31,6 +31,55 @@ BALL_WEIGHT = 0.75
 BASE_HFOV_169 = 85.0
 BASE_HFOV_916 = 52.0
 FLAT_ZOOM_169 = 1.5
+ZOOM_MAX = 1.8
+
+
+def zoom_limit(flat: bool) -> float:
+    """Flat video is already a 1.5x crop, so the extra zoom stays under 1.8x total."""
+    if flat:
+        return ZOOM_MAX / FLAT_ZOOM_169
+    return ZOOM_MAX
+
+
+def _ease(u: float) -> float:
+    u = 0.0 if u < 0.0 else 1.0 if u > 1.0 else u
+    return u * u * (3.0 - 2.0 * u)
+
+
+def animated_zoom(t: float, clip: Clip, flat: bool = False, fit: Optional[float] = None,
+                  release: Optional[float] = None) -> float:
+    """Ease from a wide view into the shot, hold through the basket, then ease back.
+
+    The curve is smooth (no steps). `fit` is an optional tighter cap so a long
+    shot can still show the shooter and the rim together.
+    """
+    cap = zoom_limit(flat)
+    if fit is not None:
+        cap = min(cap, max(1.0, float(fit)))
+    event = clip.event_time if clip.event_time else (clip.start + clip.end) / 2.0
+    rel = release if release is not None else clip.release
+    if rel is None:
+        rel = max(clip.start, event - 1.2)
+    rel = min(max(rel, clip.start), event)
+    peak = cap if clip.type in ("made", "attempt") else min(cap, 1.0 + 0.45 * (cap - 1.0))
+    follow = 1.0 + 0.4 * (peak - 1.0)
+    if t <= rel:
+        span = max(0.5, rel - clip.start)
+        return 1.0 + (follow - 1.0) * _ease((t - clip.start) / span)
+    if t <= event:
+        span = max(0.35, event - rel)
+        return follow + (peak - follow) * _ease((t - rel) / span)
+    hold = min(clip.end, event + 0.8)
+    if t <= hold:
+        return peak
+    span = max(0.45, clip.end - hold)
+    tail = min(follow, 1.0 + 0.25 * (peak - 1.0))
+    return peak + (tail - peak) * _ease((t - hold) / span)
+
+
+def zooms_are_flat(keys: list[Keyframe]) -> bool:
+    """True when every keyframe is the old default of 1.0 (zoom was never planned)."""
+    return bool(keys) and all(abs(k.zoom - 1.0) < 0.03 for k in keys)
 
 
 def circ_mean(yaws, weights=None) -> float:
@@ -151,7 +200,7 @@ def estimate_release(t_event: float, hoop: Hoop, B: np.ndarray, P: np.ndarray):
 
 
 def plan_clip(clip: Clip, d: Detections, hoops: list[Hoop], bystanders: list,
-              base_hfov: float, step: float = 0.1) -> tuple[list[Keyframe], Optional[float]]:
+              base_hfov: float, step: float = 0.1, flat: bool = False) -> tuple[list[Keyframe], Optional[float]]:
     ts = np.arange(clip.start, clip.end + 1e-6, step)
     hoop = next((h for h in hoops if h.name == clip.hoop), hoops[0] if hoops else None)
     w0, w1 = clip.start - 1.5, clip.end + 1.5
@@ -188,6 +237,7 @@ def plan_clip(clip: Clip, d: Detections, hoops: list[Hoop], bystanders: list,
 
     fast = np.zeros(len(ts), bool)
     release = clip.release
+    shooter = None
     if hoop is not None and clip.type in ("made", "attempt"):
         est = estimate_release(clip.event_time, hoop, B, P)
         shooter = None
@@ -231,6 +281,19 @@ def plan_clip(clip: Clip, d: Detections, hoops: list[Hoop], bystanders: list,
         p += (pt - p) * min(1.0, step / 0.6)
         cam_y[i], cam_p[i] = y, p
 
+    cam_z = np.empty(len(ts))
+    z = 1.0
+    rel_for_fit = release if release is not None else clip.event_time
+    for i, t in enumerate(ts):
+        fit = None
+        if shooter is not None and hoop is not None and t <= rel_for_fit + 0.25:
+            sep = abs(float(wrap180(shooter[0] - hoop.yaw)))
+            if sep > 2.0:
+                fit = 0.6 * base_hfov / sep
+        target = animated_zoom(float(t), clip, flat=flat, fit=fit, release=release)
+        z += (target - z) * min(1.0, step / 0.35)
+        cam_z[i] = z
+
     keys: list[Keyframe] = []
     marks = {}
     if release is not None and clip.type in ("made", "attempt"):
@@ -240,7 +303,7 @@ def plan_clip(clip: Clip, d: Detections, hoops: list[Hoop], bystanders: list,
         on_grid = abs((t - clip.start) / 0.5 - round((t - clip.start) / 0.5)) < 1e-6
         note = marks.get(round(float(t), 1), "")
         if on_grid or note or i == len(ts) - 1:
-            keys.append(Keyframe(clip.id, float(t), float(cam_y[i]), float(cam_p[i]), 1.0, note))
+            keys.append(Keyframe(clip.id, float(t), float(cam_y[i]), float(cam_p[i]), float(cam_z[i]), note))
     return keys, release
 
 

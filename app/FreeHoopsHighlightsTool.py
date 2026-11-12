@@ -120,6 +120,8 @@ def add_render(p: argparse.ArgumentParser) -> None:
     p.add_argument("--end-sub", default=END_SUB)
     p.add_argument("--qr-caption", default=QR_CAPTION)
     p.add_argument("--qr-url", default=DEFAULT_QR_URL)
+    p.add_argument("--preview-chunks", action="store_true",
+                   help="save the reframed clips as playable parts of about 1 minute, then build the final video from them")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -173,6 +175,7 @@ def render_settings_from_args(args, title_default: str) -> RenderSettings:
     rs.end_duration = args.end_duration
     rs.end_title, rs.end_sub = args.end_title, args.end_sub
     rs.qr_caption, rs.qr_url = args.qr_caption, args.qr_url
+    rs.preview_chunks = bool(getattr(args, "preview_chunks", False))
     return rs
 
 
