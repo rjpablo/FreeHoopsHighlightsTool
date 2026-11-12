@@ -134,7 +134,7 @@ def analyze(job: Job, ctl: JobController, progress: ProgressCb, log: Callable[[s
     for e in events:
         est = estimate_release(e.time, hoops[e.hoop], d.balls, P) if e.hoop < len(hoops) else None
         releases.append(est[0] if est else None)
-    clips = events_to_clips(events, hoops, job.clip, start, end, warm, releases)
+    clips = events_to_clips(events, hoops, job.clip, start, end, warm, releases, P, d.rim_cands)
     hf = FLAT_HFOV / FLAT_ZOOM_169 if info.kind == "flat" else BASE_HFOV_169
     keys = []
     for c in clips:
@@ -152,6 +152,11 @@ def analyze(job: Job, ctl: JobController, progress: ProgressCb, log: Callable[[s
                                  stabilized=info.stab is not None,
                                  lrv=str(info.lrv) if info.lrv else ""))
     save_project(proj, paths["project"])
+    other_side = sum(1 for c in clips if "other side of the court" in c.note)
+    if other_side:
+        log(f"Switched off {other_side} clip(s) on the other side of the court, "
+            "where people were shooting while the players were at the other basket. "
+            "Switch a clip back on in the list if it belongs in the game.")
     made = sum(1 for c in clips if c.type == "made")
     att = sum(1 for c in clips if c.type == "attempt")
     per = {h.name: sum(1 for c in clips if c.hoop == h.name and c.type == "made") for h in hoops}

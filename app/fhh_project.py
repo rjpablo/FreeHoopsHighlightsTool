@@ -208,9 +208,75 @@ class ClipSettings:
     max_total: float = 0.0       # seconds of clips (0 = no limit)
 
 
+def _ang(a):
+    return (np.asarray(a, dtype=np.float64) + 180.0) % 360.0 - 180.0
+
+
+def _crowd(persons: np.ndarray, hoop: Hoop, t: float, radius: float) -> int:
+    """How many people are at this hoop around time t (median over nearby frames)."""
+    if len(persons) == 0:
+        return 0
+    sel = persons[np.abs(persons[:, 0] - t) <= 1.2]
+    if len(sel) == 0:
+        return 0
+    counts = []
+    for ft in np.unique(np.round(sel[:, 0], 2)):
+        fr = sel[np.abs(sel[:, 0] - ft) < 0.04]
+        near = (np.abs(_ang(fr[:, 1] - hoop.yaw)) <= radius) & (fr[:, 2] > hoop.pitch - 28) & (fr[:, 2] < hoop.pitch + 12)
+        counts.append(int(np.sum(near)))
+    return int(np.median(counts)) if counts else 0
+
+
+def _rim_busy(cands: np.ndarray, hoop: int, t: float) -> int:
+    """Rim-view motion near this hoop, not counting the shot itself."""
+    if len(cands) == 0:
+        return 0
+    dt = np.abs(cands[:, 0] - t)
+    return int(np.sum((cands[:, 1] == hoop) & (dt <= 8.0) & (dt > 1.2)))
+
+
+def other_side_indexes(events: list[Event], hoops: list[Hoop], persons: np.ndarray,
+                       rim_cands: Optional[np.ndarray] = None) -> set[int]:
+    """Shots at the quiet basket while the game is at the other one.
+
+    A full-court game moves from end to end, so both hoops stay in play.
+    A basket is the other side when that hoop is quiet and the other hoop
+    has the players, or a lot more motion under the rim.
+    """
+    if len(hoops) < 2 or not events:
+        return set()
+    if rim_cands is None:
+        rim_cands = np.zeros((0, 7))
+    radii = []
+    for i, hoop in enumerate(hoops):
+        seps = [abs(float(_ang(hoop.yaw - other.yaw))) for j, other in enumerate(hoops) if j != i]
+        radii.append(float(min(40.0, max(18.0, min(seps) * 0.42))))
+    off: set[int] = set()
+    for n, e in enumerate(events):
+        if e.hoop < 0 or e.hoop >= len(hoops):
+            continue
+        here = _crowd(persons, hoops[e.hoop], e.time, radii[e.hoop]) if len(persons) else 0
+        other = 0
+        if len(persons):
+            other = max(_crowd(persons, hoops[j], e.time, radii[j]) for j in range(len(hoops)) if j != e.hoop)
+        crowd_off = other >= 5 and here <= other / 2 and here + 3 <= other
+        here_busy = _rim_busy(rim_cands, e.hoop, e.time)
+        other_busy = max(_rim_busy(rim_cands, j, e.time) for j in range(len(hoops)) if j != e.hoop)
+        # A busy rim with few detected people is still the game. An isolated
+        # swish while the other rim is busy is people shooting around.
+        motion_off = here <= 3 and other_busy >= 80 and other_busy >= max(here_busy, 1) * 3 and here_busy <= 50
+        if crowd_off or motion_off:
+            off.add(n)
+    return off
+
+
 def events_to_clips(events: list[Event], hoops: list[Hoop], cs: ClipSettings,
                     range_start: float, range_end: float, warmup: Optional[float],
-                    releases: Optional[list] = None) -> list[Clip]:
+                    releases: Optional[list] = None,
+                    persons: Optional[np.ndarray] = None,
+                    rim_cands: Optional[np.ndarray] = None) -> list[Clip]:
+    off_side = other_side_indexes(
+        events, hoops, persons if persons is not None else np.zeros((0, 5)), rim_cands)
     raw: list[Clip] = []
     for n, e in enumerate(events):
         rel = releases[n] if releases and n < len(releases) else None
@@ -219,34 +285,30 @@ def events_to_clips(events: list[Event], hoops: list[Hoop], cs: ClipSettings,
             start = min(start, rel - 2.0)  # long shots: start well before the release
         start = max(range_start, start)
         end = min(range_end, e.time + cs.post)
-        raw.append(Clip(id="", start=start, end=end, event_time=e.time, type=e.kind,
-                        hoop=hoops[e.hoop].name if e.hoop < len(hoops) else "A",
-                        score=e.score, note=e.note, release=rel))
+        clip = Clip(id="", start=start, end=end, event_time=e.time, type=e.kind,
+                    hoop=hoops[e.hoop].name if e.hoop < len(hoops) else "A",
+                    score=e.score, note=e.note, release=rel)
+        clip.other_side = n in off_side
+        raw.append(clip)
     raw.sort(key=lambda c: c.start)
     # dedupe/merge overlaps
     merged: list[Clip] = []
     for c in raw:
-        if merged and c.start < merged[-1].end:
-            m = merged[-1]
-            overlap = m.end - c.start
-            if m.hoop == c.hoop:
-                # same hoop: one longer clip (e.g. a putback after a miss)
-                both_made = m.type == "made" and c.type == "made"
-                c_better = (c.type == "made" and m.type != "made") or (c.type == m.type and c.score > m.score)
-                m.end = max(m.end, c.end)
-                if c_better:
-                    m.type, m.event_time, m.note, m.release = c.type, c.event_time, c.note, c.release
-                m.score = max(m.score, c.score)
-                if both_made:
-                    m.note = (m.note + " (+ another basket)").strip()
-                continue
-            if overlap > 2.0:
-                # different hoops overlapping a lot: one of them is wrong, keep the stronger
-                if (c.type == "made", c.score) > (m.type == "made", m.score):
-                    merged[-1] = c
-                continue
-            mid = (m.end + c.start) / 2
-            m.end, c.start = mid, mid
+        m = next((x for x in reversed(merged)
+                  if x.hoop == c.hoop and c.start < x.end and x.other_side == c.other_side), None)
+        if m is not None:
+            # same hoop: one longer clip (e.g. a putback after a miss)
+            both_made = m.type == "made" and c.type == "made"
+            c_better = (c.type == "made" and m.type != "made") or (c.type == m.type and c.score > m.score)
+            # A real game shot must not stay hidden inside an other-side clip.
+            m.end = max(m.end, c.end)
+            if c_better:
+                m.type, m.event_time, m.note, m.release = c.type, c.event_time, c.note, c.release
+            m.score = max(m.score, c.score)
+            if both_made:
+                m.note = (m.note + " (+ another basket)").strip()
+            continue
+        # The other basket can score at the same time. Keep that shot too.
         merged.append(c)
     for i, c in enumerate(merged, 1):
         c.id = f"c{i:03d}"
@@ -255,6 +317,9 @@ def events_to_clips(events: list[Event], hoops: list[Hoop], cs: ClipSettings,
         if cs.skip_warmup and warmup is not None and c.event_time < warmup:
             c.include = False
             c.note = (c.note + "; warm-up?").strip("; ")
+        if getattr(c, "other_side", False):
+            c.include = False
+            c.note = (c.note + "; other side of the court").strip("; ")
     if cs.max_total and cs.max_total > 0:
         select_balanced(merged, cs.max_total)
     return merged
