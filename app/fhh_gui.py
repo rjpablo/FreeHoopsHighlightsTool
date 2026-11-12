@@ -1155,15 +1155,25 @@ class HoopPicker:
         self.hoops: list[Hoop] = []
         self.stage = "overview"
         self.edges: list[tuple[float, float]] = []
+        self.marked = False
+        self._busy = False
+        self._gen = 0
+        self._ctl = None
+        self.aq: queue.Queue = queue.Queue()
         bar = ttk.Frame(self.top, padding=6)
         bar.pack(fill="x")
         ttk.Label(bar, text="Frame at").pack(side="left")
         start = app.range_start() or 0.0
         self.v_t = tk.StringVar(value=format_ts(min(info.duration - 1, start + 30)))
         ttk.Entry(bar, textvariable=self.v_t, width=10).pack(side="left", padx=4)
-        ttk.Button(bar, text="Load frame", command=self.load).pack(side="left", padx=4)
+        self.btn_load = ttk.Button(bar, text="Load frame", command=self.load)
+        self.btn_load.pack(side="left", padx=4)
+        self.btn_auto = ttk.Button(bar, text="Auto pick", command=self.auto_pick)
+        self.btn_auto.pack(side="left", padx=4)
         ttk.Button(bar, text="Start over", command=self.reset).pack(side="left", padx=4)
-        ttk.Button(bar, text="Done", command=self.done).pack(side="left", padx=4)
+        self.btn_done = ttk.Button(bar, text="Done", command=self.done)
+        self.btn_done.pack(side="left", padx=4)
+        self.top.protocol("WM_DELETE_WINDOW", self.close)
         self.v_help = tk.StringVar()
         ttk.Label(self.top, textvariable=self.v_help, padding=(8, 0)).pack(fill="x")
         self.canvas = tk.Canvas(self.top, width=1200, height=480, background="#111", highlightthickness=0)
@@ -1175,7 +1185,10 @@ class HoopPicker:
 
     def help(self):
         n = len(self.hoops)
-        if self.stage == "overview":
+        if self.stage == "overview" and self.marked and n:
+            word = "rim" if n == 1 else "rims"
+            self.v_help.set(f"Auto pick marked {n} {word}. Click Done to use them, or Start over to mark them yourself.")
+        elif self.stage == "overview":
             self.v_help.set(f"Click on hoop {'AB'[min(n, 1)]}'s rim (hoop {n + 1} of 2). "
                             "If a rim is hidden, load another frame. Click Done after one or two hoops.")
         else:
@@ -1205,7 +1218,7 @@ class HoopPicker:
                 sr = SceneRenderer(info, plan, self.app.v_lens.get(),
                                    eq_width=2 * plan.lens_size if info.is_fisheye else None,
                                    lat_range=ANALYSIS_BAND_PICK if info.is_fisheye else None)
-                pano = sr.panorama(frame)
+                pano = sr.panorama(frame, t)
                 if not info.is_fisheye:
                     # crop the band from a full equirect
                     H = pano.shape[0]
@@ -1254,9 +1267,17 @@ class HoopPicker:
         h, w = self.img.shape[:2]
         self.scale = min(1200 / w, 560 / h)
         self._show(self.img, int(w * self.scale), int(h * self.scale))
+        import math
         for hp in self.hoops:
             x, y = self.px_of(hp.yaw, hp.pitch)
-            x, y = x * self.scale, y * self.scale
+            if self.info.kind == "flat":
+                span = hp.width / 2
+            else:
+                span = (hp.width / 2) / max(0.2, math.cos(math.radians(hp.pitch)))
+            x1, _ = self.px_of(hp.yaw - span, hp.pitch)
+            x2, _ = self.px_of(hp.yaw + span, hp.pitch)
+            x, y, x1, x2 = x * self.scale, y * self.scale, x1 * self.scale, x2 * self.scale
+            self.canvas.create_line(x1, y, x2, y, fill="#ff8c28", width=3)
             self.canvas.create_oval(x - 9, y - 9, x + 9, y + 9, outline="#ff8c28", width=3)
             self.canvas.create_text(x, y - 18, text=hp.name, fill="#ff8c28", font=("Arial", 14, "bold"))
         self.help()
@@ -1309,12 +1330,109 @@ class HoopPicker:
         else:
             self.help()
 
+    def _set_busy(self, on: bool):
+        self._busy = on
+        state = ["disabled"] if on else ["!disabled"]
+        for btn in (self.btn_auto, self.btn_load, self.btn_done):
+            btn.state(state)
+
+    def auto_pick(self):
+        if self._busy:
+            return
+        self._gen += 1
+        gen = self._gen
+        self._ctl = JobController()
+        mode, threads = self.app._chosen_threads()
+        self._ctl.set_performance(mode, threads)
+        self._set_busy(True)
+        self.v_help.set("Looking for the rims. This can take a few minutes. Start over cancels it.")
+        threading.Thread(target=self._auto_worker, args=(gen,), daemon=True).start()
+        self.top.after(200, self._poll_auto)
+
+    def _auto_worker(self, gen: int):
+        try:
+            from fhh_core import Progress
+            from fhh_detect import QUALITY, AnalysisSettings, Detector, ensure_weights, scout_hoops
+            from fhh_source import ANALYSIS_BAND_PICK, SceneRenderer, decode_plan
+            info = self.info
+            quality = next((k for k, v in QUALITY_LABELS.items() if v == self.app.v_quality.get()), "balanced")
+            q = QUALITY[quality]
+            plan = decode_plan(info, max_lens=1920, max_width=1920 if info.kind == "flat" else 3840)
+            scene = SceneRenderer(info, plan, self.app.v_lens.get(),
+                                  eq_width=2 * plan.lens_size if info.is_fisheye else None,
+                                  lat_range=ANALYSIS_BAND_PICK if info.is_fisheye else None)
+            start = self.app.range_start() or 0.0
+            end = self.app.range_end() or info.duration
+            st = AnalysisSettings(quality=quality, start=start, end=end, lens_model=self.app.v_lens.get(),
+                                 threads=self._ctl.thread_count(None))
+            log = lambda line: self.aq.put(("status", gen, line))
+            weights = ensure_weights(q["model"], log)
+            det = Detector(weights, st.threads, log, "auto")
+            prog = Progress(lambda p: self.aq.put(("status", gen, p.message)), self._ctl)
+            prog.plan([("Finding hoops", 1.0)])
+            prog.begin("Finding hoops")
+            hoops = scout_hoops(find_tool("ffmpeg"), info, plan, scene, det, q, start, end, st,
+                               self._ctl, prog, log)
+            self.aq.put(("done", gen, hoops))
+        except RenderCancelled:
+            self.aq.put(("cancelled", gen))
+        except Exception as exc:
+            self.aq.put(("error", gen, str(exc)))
+
+    def _poll_auto(self):
+        if not self.top.winfo_exists():
+            return
+        try:
+            while True:
+                kind, gen, val = self.aq.get_nowait()
+                if gen != self._gen:
+                    continue
+                if kind == "status":
+                    self.v_help.set(val)
+                elif kind == "done":
+                    self._set_busy(False)
+                    self.hoops = list(val)
+                    self.marked = bool(self.hoops)
+                    self.stage = "overview"
+                    if self.hoops and getattr(self, "img", None) is not None:
+                        self.show_overview()
+                    elif self.hoops:
+                        n = len(self.hoops)
+                        word = "rim" if n == 1 else "rims"
+                        self.v_help.set(f"Auto pick marked {n} {word}. Click Done to use them, or Start over to mark them yourself.")
+                    else:
+                        self.v_help.set("Auto pick could not see the rims. Click each rim, or load another frame and try again.")
+                elif kind == "error":
+                    self._set_busy(False)
+                    self.app.mb.showerror(APP_NAME, val, parent=self.top)
+                    self.help()
+                elif kind == "cancelled":
+                    self._set_busy(False)
+        except queue.Empty:
+            pass
+        if self._busy and self.top.winfo_exists():
+            self.top.after(200, self._poll_auto)
+
     def reset(self):
+        self._gen += 1
+        if self._ctl is not None:
+            self._ctl.request_cancel()
+        self.marked = False
         self.hoops = []
         self.stage = "overview"
-        self.show_overview()
+        self._set_busy(False)
+        if getattr(self, "img", None) is not None:
+            self.show_overview()
+
+    def close(self):
+        self._gen += 1
+        if self._ctl is not None:
+            self._ctl.request_cancel()
+        self.top.destroy()
 
     def done(self):
+        if self._busy:
+            return
         if self.hoops:
             self.app.q.put(("hoops", list(self.hoops)))
         self.top.destroy()
@@ -1349,11 +1467,21 @@ class ClipPreview:
         from PIL import Image, ImageTk
         from fhh_camera import animated_zoom, camera_at, zooms_are_flat
         from fhh_render import _fallback_keys, base_hfov
+        from copy import copy
         from fhh_source import ClipRenderer, base_filter, decode_plan, grab_frame_raw
         self.top.configure(cursor="watch")
         self.top.update()
         try:
             info = self.info
+            if self.app.data_path:
+                proj_p = data_paths(self.app.data_path.with_suffix(".mp4"))["project"]
+                if proj_p.is_file():
+                    try:
+                        if not load_project(proj_p).settings.get("stabilized"):
+                            info = copy(self.info)
+                            info.stab = None
+                    except Exception:
+                        pass
             t = float(self.v_t.get())
             keys = []
             if self.app.data_path:
@@ -1370,7 +1498,7 @@ class ClipPreview:
             fmt = self.v_fmt.get()
             w, h = (960, 540) if fmt == "16:9" else (304, 540)
             view = ClipRenderer(info, plan, self.app.v_lens.get()).view(
-                frame, yaw, pitch, base_hfov(fmt, info) / zoom, w, h)
+                frame, yaw, pitch, base_hfov(fmt, info) / zoom, w, h, t)
             self.photo = ImageTk.PhotoImage(Image.fromarray(view[:, :, ::-1].copy()))
             self.canvas.configure(width=w, height=h)
             self.canvas.delete("all")

@@ -178,7 +178,7 @@ def render_clip_segment(ffmpeg: str, info: SourceInfo, clip: Clip, keys: list[Ke
             if zooms_are_flat(keys):
                 zoom = animated_zoom(t, clip, info.kind == "flat")
             hfov = max(10.0, min(150.0, hfov0 / max(0.5, zoom)))
-            view = renderer.view(frame, yaw, pitch, hfov, out_w, out_h)
+            view = renderer.view(frame, yaw, pitch, hfov, out_w, out_h, t)
             try:
                 enc.stdin.write(np.ascontiguousarray(view).tobytes())
             except (BrokenPipeError, OSError):

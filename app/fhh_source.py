@@ -56,6 +56,8 @@ class SourceInfo:
     sample_rate: int = 48000
     creation_time: str = ""
     notes: list[str] = field(default_factory=list)
+    lrv: Optional[Path] = None
+    stab: object = None          # Stabilizer from the .lrv, when its motion data can be read
 
     @property
     def is_sphere(self) -> bool:
@@ -73,7 +75,10 @@ class SourceInfo:
             "equirect": f"stitched 360 equirectangular {self.width}x{self.height}",
             "flat": f"flat video {self.width}x{self.height}",
         }
-        return f"{names.get(self.kind, self.kind)}, {self.fps:.3f} fps, {self.duration/60:.1f} min"
+        text = f"{names.get(self.kind, self.kind)}, {self.fps:.3f} fps, {self.duration/60:.1f} min"
+        if self.stab is not None and self.lrv is not None:
+            text += f". Leveling with {self.lrv.name}"
+        return text
 
 
 def _video_streams(data: dict) -> list[dict]:
@@ -187,6 +192,18 @@ def detect_source(path: Path, ffmpeg: str, ffprobe: str, force_kind: str = "auto
         info.lens_size = h
     elif kind == "flat" and abs(w - 2 * h) <= 4:
         info.notes.append("2:1 video treated as flat because you chose 'flat'.")
+    if ext == ".insv":
+        from fhh_stab import find_lrv, load_stabilizer
+        lrv = find_lrv(path)
+        if lrv is None and info.files:
+            lrv = find_lrv(info.files[0])
+        if lrv is not None:
+            info.lrv = lrv
+            info.stab = load_stabilizer(lrv, info.duration)
+            if info.stab is not None:
+                info.notes.append(f"Stabilizing with {lrv.name} (level horizon, less shake).")
+            else:
+                info.notes.append(f"Found {lrv.name}, but it has no usable motion data. Continuing without stabilization.")
     return info
 
 
@@ -590,20 +607,37 @@ class SceneRenderer:
     def __init__(self, info: SourceInfo, plan: DecodePlan, lens_model: str = "x4",
                  eq_width: Optional[int] = None, lat_range: Optional[tuple[float, float]] = None):
         self.info, self.plan = info, plan
+        self.stab = info.stab
         self.stitcher: Optional[Stitcher] = None
+        self.out_rows = 0
         if info.is_fisheye:
             w = eq_width or min(2 * plan.lens_size * 2 // 2, 7680)
-            self.stitcher = Stitcher(plan.lens_size, w, lens_model, lat_range=lat_range)
-            self.eq_w, self.eq_h, self.row0 = self.stitcher.W, self.stitcher.H, self.stitcher.row0
+            stitch_range = lat_range
+            if self.stab is not None and lat_range is not None:
+                lo, hi = lat_range
+                stitch_range = (max(-85.0, lo - 25.0), min(85.0, hi + 25.0))
+            self.stitcher = Stitcher(plan.lens_size, w, lens_model, lat_range=stitch_range)
+            self.eq_w, self.eq_h = self.stitcher.W, self.stitcher.H
+            if self.stab is not None and lat_range is not None:
+                lo, hi = lat_range
+                self.row0 = max(0, int(math.floor((90 - hi) / 180 * self.eq_h)))
+                r1 = min(self.eq_h, int(math.ceil((90 - lo) / 180 * self.eq_h)))
+                self.out_rows = max(1, r1 - self.row0)
+            else:
+                self.row0 = self.stitcher.row0
+                self.out_rows = self.stitcher.shape[0]
         elif info.kind == "equirect":
             self.eq_w, self.eq_h, self.row0 = plan.width, plan.height, 0
         else:
             self.eq_w = self.eq_h = self.row0 = 0
 
-    def panorama(self, frame: np.ndarray) -> np.ndarray:
-        if self.stitcher is not None:
-            return self.stitcher.stitch(frame)
-        return frame
+    def panorama(self, frame: np.ndarray, t: float = 0.0) -> np.ndarray:
+        if self.stitcher is None:
+            return frame
+        img = self.stitcher.stitch(frame)
+        if self.stab is None:
+            return img
+        return self.stab.level_band(img, self.stitcher.row0, self.eq_h, self.row0, self.out_rows, t)
 
     def view(self, pano: np.ndarray, yaw: float, pitch: float, hfov: float, out_w: int, out_h: int) -> np.ndarray:
         if self.info.kind == "flat":
@@ -625,7 +659,8 @@ class DirectFisheyeView:
         self.L0, self.L1 = load_lens_models(lens_size, model, calib_path)
         self.feather = feather
 
-    def maps(self, yaw: float, pitch: float, hfov: float, out_w: int, out_h: int, step: int = 8):
+    def maps(self, yaw: float, pitch: float, hfov: float, out_w: int, out_h: int, step: int = 8,
+             to_body: Optional[np.ndarray] = None):
         cv2 = _cv2()
         gw, gh = max(2, out_w // step + 2), max(2, out_h // step + 2)
         f = (out_w / 2.0) / math.tan(math.radians(hfov) / 2)
@@ -639,6 +674,8 @@ class DirectFisheyeView:
             [[1, 0, 0], [0, math.cos(math.radians(pitch)), -math.sin(math.radians(pitch))],
              [0, math.sin(math.radians(pitch)), math.cos(math.radians(pitch))]])
         world = rays @ R.T
+        if to_body is not None:
+            world = world @ to_body
         u0, v0, t0 = _project(world, self.L0)
         u1, v1, t1 = _project(world, self.L1)
         u1 = np.where(v1 < -1e3, -64.0, u1 + self.S)
@@ -651,9 +688,10 @@ class DirectFisheyeView:
             return cv2.resize(a.astype(np.float32), (out_w, out_h), interpolation=cv2.INTER_LINEAR)
         return up(u0), up(v0), up(u1), up(v1), up(w0)
 
-    def view(self, frame: np.ndarray, yaw: float, pitch: float, hfov: float, out_w: int, out_h: int) -> np.ndarray:
+    def view(self, frame: np.ndarray, yaw: float, pitch: float, hfov: float, out_w: int, out_h: int,
+             to_body: Optional[np.ndarray] = None) -> np.ndarray:
         cv2 = _cv2()
-        u0, v0, u1, v1, w0 = self.maps(yaw, pitch, hfov, out_w, out_h)
+        u0, v0, u1, v1, w0 = self.maps(yaw, pitch, hfov, out_w, out_h, to_body=to_body)
         wmin, wmax = float(w0.min()), float(w0.max())
         if wmin >= 0.999:
             return cv2.remap(frame, u0, v0, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
@@ -669,11 +707,14 @@ class ClipRenderer:
 
     def __init__(self, info: SourceInfo, plan: DecodePlan, lens_model: str = "x4"):
         self.info = info
+        self.stab = info.stab
         self.direct = DirectFisheyeView(plan.lens_size, lens_model) if info.is_fisheye else None
 
-    def view(self, frame: np.ndarray, yaw: float, pitch: float, hfov: float, out_w: int, out_h: int) -> np.ndarray:
+    def view(self, frame: np.ndarray, yaw: float, pitch: float, hfov: float, out_w: int, out_h: int,
+             t: Optional[float] = None) -> np.ndarray:
+        to_body = self.stab.to_body(t) if self.stab is not None and t is not None else None
         if self.direct is not None:
-            return self.direct.view(frame, yaw, pitch, hfov, out_w, out_h)
+            return self.direct.view(frame, yaw, pitch, hfov, out_w, out_h, to_body=to_body)
         if self.info.kind == "equirect":
             return render_view(frame, yaw, pitch, hfov, out_w, out_h)
         return render_flat_view(frame, yaw, pitch, hfov, out_w, out_h)

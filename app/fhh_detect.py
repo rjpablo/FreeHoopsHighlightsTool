@@ -359,7 +359,7 @@ def run_analysis(ffmpeg: str, info: SourceInfo, hoops: list[Hoop], st: AnalysisS
         if is_flat:
             pano_img, full_h, row0 = frame, frame.shape[0], 0
         else:
-            pano_img = scene.panorama(frame)
+            pano_img = scene.panorama(frame, t)
             full_h, row0 = scene.eq_h, scene.row0
         # --- full-court detection (players + ball) for the virtual camera
         if i % q["every"] == 0:
@@ -482,7 +482,7 @@ def scout_hoops(ffmpeg, info, plan, scene, det, q, start, end, st, ctl, prog, lo
             conv = lambda x, y: flat_to_scene(x, y, w, h)
             wrap_w = 0
         else:
-            img = scene.panorama(frame)
+            img = scene.panorama(frame, t)
             pano = Panorama(img, scene.eq_h, scene.row0)
             tiles = band_tiles(pano, (-10.0, 40.0))
             conv = pano.to_scene

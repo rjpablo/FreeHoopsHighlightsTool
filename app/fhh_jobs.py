@@ -148,7 +148,9 @@ def analyze(job: Job, ctl: JobController, progress: ProgressCb, log: Callable[[s
     proj = Project(input=str(job.input_path), kind=info.kind, start=start, end=end, hoops=hoops,
                    bystanders=by, warmup_end=warm, detections=str(det_path),
                    settings=dict(quality=job.quality, sensitivity=job.sensitivity, lens_model=job.lens_model,
-                                 pre=job.clip.pre, post=job.clip.post, version=VERSION))
+                                 pre=job.clip.pre, post=job.clip.post, version=VERSION,
+                                 stabilized=info.stab is not None,
+                                 lrv=str(info.lrv) if info.lrv else ""))
     save_project(proj, paths["project"])
     made = sum(1 for c in clips if c.type == "made")
     att = sum(1 for c in clips if c.type == "attempt")
@@ -187,6 +189,11 @@ def render(job: Job, clips_csv: Path, ctl: JobController, progress: ProgressCb,
     job.render.threads = threads
     job.render.lens_model = job.lens_model
     info = detect_source(Path(src), ffmpeg, ffprobe, proj.kind if proj and job.source_kind == "auto" else job.source_kind)
+    if not (proj and proj.settings.get("stabilized")):
+        info.stab = None
+    elif info.stab is None:
+        log("This highlight list was leveled from an .lrv, but that file is not next to the .insv. "
+            "The picture will not be stabilized.")
     log(f"Input: {info.describe()}")
     clips = read_clips(Path(clips_csv))
     keys = read_keyframes(paths["camera"])
