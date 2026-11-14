@@ -23,12 +23,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
-VERSION = "1.1"
+VERSION = "1.2"
 APP_NAME = "FreeHoops Highlights Tool"
 SETTINGS_NAME = "FreeHoopsHighlightsTool.settings.json"
 APP_REQUIRES_RUNTIME = "1.0"
 APP_REQUIRES_ASSETS = "1.0"
-FULL_ZIP = "FreeHoopsHighlightsTool_v1.0.zip"
+FULL_ZIP = "FreeHoopsHighlightsTool_v1.2.zip"
 PERF_MODES = ("full", "balanced", "background", "custom")
 PERF_LABELS = {
     "full": "Full",

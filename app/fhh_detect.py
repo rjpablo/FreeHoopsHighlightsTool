@@ -5,10 +5,12 @@ One decode of the chosen time range at the analysis frame rate:
     the court band of the 360 panorama (or the flat frame), conf 0.1, as in
     the v2 auto-zoom pipeline. These detections drive the virtual camera.
   * every frame: a close-up "rim view" of each hoop. Frame differencing
-    gates YOLO ball detection there, and ball candidates above the rim
-    followed by candidates inside the net zone mark made baskets. Net
-    motion spikes add confidence.
+    gates YOLO ball detection there; candidates are verified by a downward
+    through-rim / net check (roll-outs rejected). Net motion spikes add
+    confidence. Warm-up, camera-setup, lone-shooter, and occlusion rules
+    mark false candidates for the review step.
 Detections are cached (npz) so clips can be re-planned without re-detecting.
+See docs/HIGHLIGHT_STRATEGY.md.
 """
 
 from __future__ import annotations
@@ -72,10 +74,15 @@ class Hoop:
 
 
 def estimate_rim_width(pitch: float) -> float:
-    """Guess the rim's apparent width from its elevation (camera ~1.6 m high)."""
+    """Guess the rim's apparent width from its elevation (camera ~1.6 m high).
+
+    Uses a slightly conservative diameter so the through-rim zone stays tight;
+    an overestimated width lets roll-outs and near-misses look like makes.
+    """
     p = max(2.0, float(pitch))
     dist = 1.45 / math.tan(math.radians(p))
-    return float(np.clip(math.degrees(0.45 / max(dist, 1.0)), 0.8, 6.0))
+    # 0.40 m ≈ rim diameter with a bit of foreshortening; cap lower than before.
+    return float(np.clip(math.degrees(0.40 / max(dist, 1.0)), 0.7, 3.2))
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +144,8 @@ class Detector:
         if device == "auto":
             device = "cuda:0" if torch.cuda.is_available() else "cpu"
         self.device = device
-        self.half = device.startswith("cuda")
+        # half= only on CUDA; passing half=False still triggers Ultralytics warnings.
+        self.half = str(device).startswith("cuda") and torch.cuda.is_available()
         self.model = YOLO(str(weights))
         self.names = getattr(self.model, "names", {}) or {}
         log(f"Detector: {Path(weights).name} on {'GPU (CUDA)' if self.half else 'CPU'}")
@@ -148,8 +156,10 @@ class Detector:
     def __call__(self, images: list[np.ndarray], imgsz: int, conf: float, classes=None):
         if not images:
             return []
-        res = self.model.predict(images, imgsz=imgsz, conf=conf, classes=classes, verbose=False,
-                                 device=self.device, half=self.half)
+        kwargs = dict(imgsz=imgsz, conf=conf, classes=classes, verbose=False, device=self.device)
+        if self.half:
+            kwargs["half"] = True
+        res = self.model.predict(images, **kwargs)
         out = []
         for r in res:
             b = r.boxes
@@ -206,7 +216,8 @@ class RimView:
 
     @staticmethod
     def make(hoop: Hoop, size: int, flat: bool) -> "RimView":
-        fov = float(np.clip(hoop.width * 11.0, 8.0, 32.0))
+        # Tighter FOV than before so the through-rim cylinder stays useful.
+        fov = float(np.clip(hoop.width * 9.0, 7.0, 26.0))
         off = fov * 0.12  # rim sits a bit below centre: more room for the arc above
         f = (size / 2) / math.tan(math.radians(fov) / 2)
         if flat:
@@ -545,22 +556,163 @@ def scout_hoops(ffmpeg, info, plan, scene, det, q, start, end, st, ctl, prog, lo
 
 
 # ---------------------------------------------------------------------------
-# Events
+# Events (strategy A: broad candidates -> rim verify -> reject -> rank)
 # ---------------------------------------------------------------------------
 
 @dataclass
 class Event:
     time: float           # moment the ball goes through (or reaches) the rim
     hoop: int
-    kind: str             # made | attempt
+    kind: str             # made | attempt | play
     score: float
     note: str = ""
+    rejected: bool = False
+    reject_reason: str = ""
+
+
+def _rim_weight(cf: float, src: float) -> float:
+    return float(cf) if int(src) == 0 else 0.09
+
+
+def verify_rim_make(cands: np.ndarray, net_rows: np.ndarray, t_hint: float,
+                    window: float = 1.2, sensitivity: float = 0.5) -> Optional[tuple[float, float, str]]:
+    """Confirm a made basket by requiring a downward pass through the rim into the net.
+
+    cands columns: t, hoop, dx, dy, conf, src, size (already filtered to one hoop).
+    Returns (ball_in_time, score, note) or None.
+    """
+    if len(cands) == 0:
+        return None
+    sens = float(np.clip(sensitivity, 0, 1))
+    made_thr = 0.68 - 0.28 * sens
+    t_arr = cands[:, 0]
+    dx, dy = cands[:, 2], cands[:, 3]
+    weight = np.array([_rim_weight(c[4], c[5]) for c in cands])
+    sel = (t_arr >= t_hint - 0.55) & (t_arr <= t_hint + window)
+    if not sel.any():
+        return None
+    idx = np.flatnonzero(sel)
+    above = (np.abs(dx) < 1.4) & (dy > -4.5) & (dy < -0.25)
+    through = (np.abs(dx) < 0.48) & (dy > -0.25) & (dy < 1.55)
+    net_zone = (np.abs(dx) < 0.55) & (dy > 0.15) & (dy < 1.8)
+    beside = (np.abs(dx) > 0.75) & (np.abs(dx) < 2.8) & (dy > -0.6) & (dy < 1.2)
+    above_i = idx[above[idx]]
+    if len(above_i) == 0:
+        # Scoreboard path: allow a through/net-only confirmation near the hint.
+        th_only = idx[through[idx] | net_zone[idx]]
+        if len(th_only) == 0:
+            return None
+        j = int(th_only[np.argmax(weight[th_only])])
+        t2 = float(t_arr[j])
+        net_bonus, net_peak, base = _net_bonus(net_rows, t2)
+        if net_bonus <= 0 and weight[j] < 0.25:
+            return None
+        score = 0.35 + 0.4 * min(1.0, weight[j] * 1.6) + net_bonus
+        if score < made_thr:
+            return None
+        return t2, round(float(score), 3), f"rim confirm{' + net' if net_bonus else ''}"
+
+    best: Optional[tuple[float, float, str]] = None
+    used_until = -1e9
+    for i in above_i:
+        t1 = float(t_arr[i])
+        if t1 < used_until:
+            continue
+        win = idx[(t_arr[idx] > t1) & (t_arr[idx] <= t1 + 1.0)]
+        if len(win) == 0:
+            continue
+        # Must descend: later samples closer to / below the rim than the peak above.
+        later_above = win[above[win] & (dy[win] > dy[i] - 0.05)]
+        descending = len(later_above) > 0 or any(dy[j] > dy[i] for j in win)
+        th = win[through[win]]
+        nz = win[net_zone[win]]
+        if len(th) == 0 and len(nz) == 0:
+            continue
+        # Prefer the earliest sample that is through the rim or in the net, with
+        # dy greater than the above sample (downward in image space).
+        path = np.concatenate([th, nz]) if len(th) and len(nz) else (th if len(th) else nz)
+        path = path[dy[path] >= dy[i] - 0.1]
+        if len(path) == 0:
+            continue
+        # Order by time; require overall downward progress through the cylinder.
+        path = path[np.argsort(t_arr[path])]
+        j = int(path[0])
+        for cand_j in path:
+            if dy[cand_j] > -0.05:  # at rim line or below
+                j = int(cand_j)
+                break
+        t2 = float(t_arr[j])
+        # Roll-out rejection: ball reappears clearly above the rim after "through".
+        after = idx[(t_arr[idx] > t2) & (t_arr[idx] <= t2 + 0.7)]
+        roll_out = after[(np.abs(dx[after]) < 1.2) & (dy[after] < -0.55) & (dy[after] < dy[j] - 0.4)]
+        if len(roll_out) and weight[roll_out].max() >= 0.12:
+            continue
+        bes = idx[(t_arr[idx] > t1) & (t_arr[idx] <= t2 + 0.4) & beside[idx]]
+        s_above = float(min(1.0, weight[i] * 1.6 + (0.12 if descending else 0)))
+        s_through = float(min(1.0, weight[j] * 1.6))
+        net_bonus, net_peak, base = _net_bonus(net_rows, t2)
+        # Path must continue into the net zone or show net motion (swish / soft make).
+        into_net = np.any(net_zone[path]) or net_bonus > 0
+        if not into_net and dy[j] < 0.2:
+            continue
+        bes_pen = 0.22 * float(min(1.0, weight[bes].max() * 1.6)) if len(bes) else 0.0
+        score = 0.4 * s_above + 0.4 * s_through + net_bonus - bes_pen + (0.12 if into_net else 0.0)
+        if score < made_thr:
+            continue
+        note = "through rim"
+        if net_bonus:
+            note += " + net"
+        if not descending:
+            note += " (weak descent)"
+        cand = (t2, round(float(score), 3), note)
+        if best is None or cand[1] > best[1]:
+            best = cand
+        used_until = t2 + 1.4
+    return best
+
+
+def _net_bonus(net_rows: np.ndarray, t2: float) -> tuple[float, float, float]:
+    if len(net_rows) == 0:
+        return 0.0, 0.0, 0.0
+    base = float(np.median(net_rows[:, 2]))
+    net_sel = net_rows[(net_rows[:, 0] >= t2 - 0.1) & (net_rows[:, 0] <= t2 + 0.85)]
+    net_peak = float(net_sel[:, 2].max()) if len(net_sel) else 0.0
+    bonus = 0.28 if net_peak > max(0.08, 2.8 * base) else 0.0
+    return bonus, net_peak, base
+
+
+def _candidate_seeds(cands: np.ndarray, net_rows: np.ndarray) -> list[float]:
+    """Broad candidate times: ball/motion above or through the rim, or net spikes."""
+    seeds: list[float] = []
+    if len(cands):
+        t_arr, dx, dy = cands[:, 0], cands[:, 2], cands[:, 3]
+        interesting = (
+            ((np.abs(dx) < 1.6) & (dy > -4.5) & (dy < -0.2))
+            | ((np.abs(dx) < 0.55) & (dy > -0.4) & (dy < 1.8))
+        )
+        for t in t_arr[interesting]:
+            seeds.append(float(t))
+    if len(net_rows):
+        base = float(np.median(net_rows[:, 2])) if len(net_rows) else 0.0
+        thr = max(0.1, 3.2 * base)
+        for row in net_rows:
+            if row[2] >= thr:
+                seeds.append(float(row[0]))
+    seeds.sort()
+    # Collapse seeds within 0.35 s.
+    out: list[float] = []
+    for t in seeds:
+        if not out or t - out[-1] >= 0.35:
+            out.append(t)
+        else:
+            out[-1] = 0.5 * (out[-1] + t)
+    return out
 
 
 def detect_events(d: Detections, hoops: list[Hoop], sensitivity: float = 0.5) -> list[Event]:
+    """Generate make/attempt events from rim candidates (no-scoreboard path)."""
     sens = float(np.clip(sensitivity, 0, 1))
-    made_thr = 0.62 - 0.3 * sens
-    att_thr = 0.45 - 0.2 * sens
+    att_thr = 0.42 - 0.18 * sens
     events: list[Event] = []
     C = d.rim_cands
     N = d.rim_net
@@ -569,47 +721,89 @@ def detect_events(d: Detections, hoops: list[Hoop], sensitivity: float = 0.5) ->
         nn = N[N[:, 1] == k] if len(N) else N
         if len(c) == 0:
             continue
-        base = float(np.median(nn[:, 2])) if len(nn) else 0.0
-        t_arr, dx, dy, cf, src = c[:, 0], c[:, 2], c[:, 3], c[:, 4], c[:, 5]
-        above = (np.abs(dx) < 1.6) & (dy > -4.5) & (dy < -0.35)
-        through = (np.abs(dx) < 0.55) & (dy > -0.3) & (dy < 1.7)
-        beside = (np.abs(dx) > 0.8) & (np.abs(dx) < 2.8) & (dy > -0.6) & (dy < 1.2)
-        weight = np.where(src == 0, cf, 0.09)  # YOLO confidence, or 0.09 for a motion blob
+        seeds = _candidate_seeds(c, nn)
         used_until = -1e9
-        for i in np.flatnonzero(above):
-            t1 = t_arr[i]
-            if t1 < used_until:
+        for seed in seeds:
+            if seed < used_until:
                 continue
-            win = (t_arr > t1) & (t_arr <= t1 + 0.9)
-            th = np.flatnonzero(win & through)
-            later_above = np.flatnonzero(win & above & (dy > dy[i]))
-            descending = len(later_above) > 0
-            bes = np.flatnonzero((t_arr > t1) & (t_arr <= t1 + 1.3) & beside)
-            s_above = float(min(1.0, weight[i] * 1.6 + (0.15 if descending else 0)))
-            if len(th):
-                j = th[np.argmax(weight[th])]
-                t2 = float(t_arr[j])
-                s_through = float(min(1.0, weight[j] * 1.6))
-                net_sel = nn[(nn[:, 0] >= t2 - 0.15) & (nn[:, 0] <= t2 + 0.8)] if len(nn) else nn
-                net_peak = float(net_sel[:, 2].max()) if len(net_sel) else 0.0
-                net_bonus = 0.25 if net_peak > max(0.08, 3 * base) else 0.0
-                bes_pen = 0.0
-                if len(bes):
-                    bes_pen = 0.2 * float(min(1.0, weight[bes].max() * 1.6))
-                score = 0.45 * s_above + 0.45 * s_through + net_bonus - bes_pen + 0.1
-                if score >= made_thr:
-                    events.append(Event(t2, k, "made", round(score, 3),
-                                        f"through rim{' + net' if net_bonus else ''}"))
-                    used_until = t2 + 1.5
-                    continue
+            verified = verify_rim_make(c, nn, seed, sensitivity=sens)
+            if verified is not None:
+                t2, score, note = verified
+                events.append(Event(t2, k, "made", score, note))
+                used_until = t2 + 1.6
+                continue
+            # Attempt: descending ball above the rim without a clean through.
+            t_arr, dx, dy = c[:, 0], c[:, 2], c[:, 3]
+            weight = np.array([_rim_weight(r[4], r[5]) for r in c])
+            above = (np.abs(c[:, 0] - seed) < 0.45) & (np.abs(dx) < 1.5) & (dy > -4.5) & (dy < -0.3)
+            if not above.any():
+                continue
+            i = int(np.flatnonzero(above)[np.argmax(weight[above])])
+            win = (t_arr > t_arr[i]) & (t_arr <= t_arr[i] + 0.9)
+            descending = np.any(win & (np.abs(dx) < 1.5) & (dy > dy[i]) & (dy < -0.1))
+            s_above = float(min(1.0, weight[i] * 1.6 + (0.12 if descending else 0)))
             if descending and s_above >= att_thr:
-                events.append(Event(float(t1) + 0.3, k, "attempt", round(0.6 * s_above, 3), "ball at rim"))
-                used_until = t1 + 1.5
+                events.append(Event(float(t_arr[i]) + 0.35, k, "attempt",
+                                    round(0.55 * s_above, 3), "ball at rim"))
+                used_until = float(t_arr[i]) + 1.4
     events.sort(key=lambda e: e.time)
-    # dedupe: same hoop within 2.5 s -> keep the best (made beats attempt)
+    return _dedupe_events(events)
+
+
+def events_from_score_times(score_times: list[float], d: Detections, hoops: list[Hoop],
+                            sensitivity: float = 0.5,
+                            hoop_hints: Optional[list[Optional[int]]] = None) -> list[Event]:
+    """Scoreboard / score-log path: each score change is a candidate, refined by rim check."""
+    sens = float(np.clip(sensitivity, 0, 1))
+    C = d.rim_cands
+    N = d.rim_net
+    events: list[Event] = []
+    for n, t0 in enumerate(score_times):
+        hint = hoop_hints[n] if hoop_hints and n < len(hoop_hints) else None
+        best: Optional[Event] = None
+        hoop_range = [hint] if hint is not None else list(range(len(hoops)))
+        for k in hoop_range:
+            if k is None or k < 0 or k >= len(hoops):
+                continue
+            c = C[C[:, 1] == k] if len(C) else C
+            nn = N[N[:, 1] == k] if len(N) else N
+            verified = verify_rim_make(c, nn, float(t0), window=1.4, sensitivity=sens)
+            if verified is None:
+                # Soft accept: scoreboard already confirmed a point; keep with lower score
+                # only if there is *some* rim activity nearby.
+                near = c[(np.abs(c[:, 0] - t0) <= 1.2)] if len(c) else c
+                if len(near) == 0 and len(nn):
+                    near_net = nn[(nn[:, 0] >= t0 - 0.4) & (nn[:, 0] <= t0 + 1.0)]
+                    if len(near_net) and float(near_net[:, 2].max()) > 0.05:
+                        ev = Event(float(t0), k, "made", 0.55, "scoreboard (weak rim)")
+                        if best is None or ev.score > best.score:
+                            best = ev
+                    continue
+                if len(near) == 0:
+                    continue
+                ev = Event(float(t0), k, "made", 0.58, "scoreboard (rim activity)")
+            else:
+                t2, score, note = verified
+                # Prefer the verified rim time when it is close to the score change.
+                t_use = t2 if abs(t2 - t0) <= 1.5 else float(t0)
+                ev = Event(t_use, k, "made", max(score, 0.7), f"scoreboard + {note}")
+            if best is None or ev.score > best.score:
+                best = ev
+        if best is None:
+            # No rim activity at either hoop: drop (weak / obstructed / wrong time).
+            events.append(Event(float(t0), 0, "made", 0.2, "scoreboard only",
+                                rejected=True, reject_reason="no rim confirmation"))
+        else:
+            events.append(best)
+    events.sort(key=lambda e: e.time)
+    return _dedupe_events(events)
+
+
+def _dedupe_events(events: list[Event], gap: float = 2.2) -> list[Event]:
     out: list[Event] = []
     for e in events:
-        dup = next((o for o in out if o.hoop == e.hoop and abs(o.time - e.time) < 2.5), None)
+        dup = next((o for o in out if o.hoop == e.hoop and abs(o.time - e.time) < gap
+                    and (not o.rejected) == (not e.rejected)), None)
         if dup is None:
             out.append(e)
             continue
@@ -619,8 +813,103 @@ def detect_events(d: Detections, hoops: list[Hoop], sensitivity: float = 0.5) ->
     return out
 
 
+def person_count_near(persons: np.ndarray, hoop: Hoop, t: float, radius: float = 28.0,
+                      half_window: float = 1.0) -> int:
+    if len(persons) == 0:
+        return 0
+    sel = persons[np.abs(persons[:, 0] - t) <= half_window]
+    if len(sel) == 0:
+        return 0
+    near = (np.abs(wrap180(sel[:, 1] - hoop.yaw)) <= radius) & (sel[:, 2] > hoop.pitch - 30) & (
+        sel[:, 2] < hoop.pitch + 14)
+    # Unique-ish people by yaw bin.
+    ys = sel[near][:, 1]
+    if len(ys) == 0:
+        return 0
+    bins = np.round(ys / 4.0)
+    return int(len(np.unique(bins)))
+
+
+def total_persons_at(persons: np.ndarray, t: float, half_window: float = 0.8) -> int:
+    if len(persons) == 0:
+        return 0
+    sel = persons[np.abs(persons[:, 0] - t) <= half_window]
+    if len(sel) == 0:
+        return 0
+    bins = np.round(sel[:, 1] / 5.0)
+    return int(len(np.unique(bins)))
+
+
+def large_person_occlusion(persons: np.ndarray, hoop: Hoop, t: float) -> bool:
+    """Someone standing close in front of the rim (blocking the camera view of the basket)."""
+    if len(persons) == 0:
+        return False
+    sel = persons[np.abs(persons[:, 0] - t) <= 0.7]
+    if len(sel) == 0:
+        return False
+    # Very tall apparent height near the hoop yaw = close to the lens / covering the rim.
+    close = (np.abs(wrap180(sel[:, 1] - hoop.yaw)) < 18.0) & (sel[:, 3] >= 28.0)
+    return bool(np.any(close))
+
+
+def camera_setup_end(d: Detections, start: float, max_scan: float = 90.0) -> Optional[float]:
+    """Return when camera setup / people blocking the lens seem finished.
+
+    Heuristic: early stretch with few people and/or unusually large person boxes
+    (someone adjusting the tripod in front of the lens), then a quieter court.
+    """
+    if len(d.times) < 8:
+        return None
+    t0 = float(d.times[0])
+    t_end = min(float(d.times[-1]), t0 + max_scan)
+    setup_until = None
+    t = t0
+    while t < t_end:
+        sel = d.persons[np.abs(d.persons[:, 0] - t) <= 1.0] if len(d.persons) else d.persons
+        n = total_persons_at(d.persons, t) if len(d.persons) else 0
+        big = bool(len(sel) and np.any(sel[:, 3] >= 32.0))
+        # Near t=0 with almost nobody, or a huge person filling the frame.
+        if t <= t0 + 25.0 and (n <= 1 or big):
+            setup_until = t + 2.0
+        elif setup_until is not None and n >= 3 and not big:
+            break
+        t += 2.0
+    # Always treat the first ~2 s as suspect when the range starts at 0 (lens cap / walk-up).
+    if start <= 0.5:
+        setup_until = max(setup_until or 0.0, start + 2.5)
+    return setup_until
+
+
+def game_start_time(d: Detections, start: float) -> Optional[float]:
+    """When a real game-like crowd first appears (5+ people sustained)."""
+    if len(d.times) < 10 or len(d.persons) == 0:
+        return None
+    win = 20.0
+    t = float(d.times[0])
+    last = float(d.times[-1])
+    while t < last:
+        sel = (d.times >= t) & (d.times < t + win)
+        if sel.sum() >= 4:
+            counts = [total_persons_at(d.persons, float(tt)) for tt in d.times[sel]]
+            if float(np.median(counts)) >= 5.0:
+                return max(start, t)
+        t += win / 2
+    return None
+
+
 def warmup_end(d: Detections, start: float) -> Optional[float]:
-    """Pre-game shootaround has several balls in play at once. Return when it ends."""
+    """Pre-game shootaround: several balls, or lone/few shooters before the game starts."""
+    multi_end = _warmup_multiball_end(d, start)
+    game = game_start_time(d, start)
+    lone_end = None
+    if game is not None and game > start + 15:
+        # Before the game, sparse players making baskets = warm-up / lone shooters.
+        lone_end = game
+    ends = [x for x in (multi_end, lone_end) if x is not None]
+    return max(ends) if ends else multi_end
+
+
+def _warmup_multiball_end(d: Detections, start: float) -> Optional[float]:
     if len(d.times) < 10 or len(d.balls) == 0:
         return None
     B = d.balls[d.balls[:, 3] >= 0.25]
@@ -655,3 +944,43 @@ def warmup_end(d: Detections, start: float) -> Optional[float]:
                     return None
         t += win
     return last_multi
+
+
+def apply_rejection_rules(events: list[Event], d: Detections, hoops: list[Hoop],
+                          warmup: Optional[float], setup_until: Optional[float],
+                          skip_warmup: bool = True) -> list[Event]:
+    """Mark events that look like camera setup, warm-ups, lone shooters, or occlusion."""
+    out: list[Event] = []
+    for e in events:
+        if e.rejected:
+            out.append(e)
+            continue
+        reasons: list[str] = []
+        if setup_until is not None and e.time <= setup_until:
+            reasons.append("camera setup")
+        if skip_warmup and warmup is not None and e.time < warmup:
+            reasons.append("warm-up")
+        hoop = hoops[e.hoop] if 0 <= e.hoop < len(hoops) else None
+        if hoop is not None:
+            crowd = person_count_near(d.persons, hoop, e.time)
+            total = total_persons_at(d.persons, e.time)
+            # Lone shooter: one person at the hoop and almost nobody else on court.
+            if crowd <= 1 and total <= 2 and e.kind == "made":
+                # Allow late-game isolation (fast break) only when the other end also
+                # has some activity in the recent past, or total people later grow.
+                if warmup is None or e.time < (warmup + 30):
+                    reasons.append("lone shooter")
+            if large_person_occlusion(d.persons, hoop, e.time):
+                reasons.append("occlusion")
+        if reasons:
+            e = Event(e.time, e.hoop, e.kind, e.score, e.note,
+                      rejected=True, reject_reason="; ".join(reasons))
+        out.append(e)
+    return out
+
+
+def rank_events(events: list[Event]) -> list[Event]:
+    """Stable game-order list; rejected events keep lower effective score for review."""
+    def key(e: Event):
+        return (e.time, -e.score if not e.rejected else 0.0)
+    return sorted(events, key=key)

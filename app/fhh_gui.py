@@ -17,6 +17,7 @@ from fhh_core import (
     parse_optional_time, parse_time, priority_name, resolve_threads, save_settings,
     saved_output_dir, unique_name,
 )
+from fhh_ai_review import AIReviewSettings
 from fhh_detect import QUALITY, QUALITY_LABELS, Hoop, estimate_rim_width
 from fhh_jobs import Job, analyze, default_title, music_tracks, render, shots_dir_for
 from fhh_project import (
@@ -83,11 +84,13 @@ class App:
         self.v_srcinfo = V(value="Pick an .insv, 360 MP4, or game video.")
         self.v_quality = V(value=QUALITY_LABELS.get(s.get("quality", "balanced"), QUALITY_LABELS["balanced"]))
         self.v_sens = tk.DoubleVar(value=float(s.get("sensitivity", 0.5)))
-        self.v_pre = V(value=str(s.get("pre", 6)))
-        self.v_post = V(value=str(s.get("post", 3)))
+        self.v_pre = V(value=str(s.get("pre", 3.5)))
+        self.v_post = V(value=str(s.get("post", 1.0)))
         self.v_attempts = B(value=bool(s.get("attempts", False)))
         self.v_warmup = B(value=bool(s.get("skip_warmup", True)))
         self.v_maxlen = V(value=str(s.get("max_length", "")))
+        self.v_score_log = V(value=str(s.get("score_log", "")))
+        self.v_ai_review = B(value=bool(s.get("ai_review", False)))
         self.v_lens = V(value=s.get("lens_model", "x4"))
         self.v_hoops = V()
         self.v_f169 = B(value=bool(s.get("f169", True)))
@@ -236,17 +239,28 @@ class App:
         of = ttk.Frame(f2)
         of.grid(row=4, column=1, columnspan=3, sticky="w")
         lock(ttk.Checkbutton(of, text="Switch on missed/unclear shots at the rim too", variable=self.v_attempts)).pack(side="left", padx=4)
-        lock(ttk.Checkbutton(of, text="Skip warm-ups (switch off clips while several balls are in play)",
+        lock(ttk.Checkbutton(of, text="Skip warm-ups (multi-ball / lone shooters before tip-off)",
                              variable=self.v_warmup)).pack(side="left", padx=12)
+        ttk.Label(f2, text="Score log (optional)").grid(row=5, column=0, sticky="w", **P)
+        sf2 = ttk.Frame(f2)
+        sf2.grid(row=5, column=1, columnspan=3, sticky="ew")
+        lock(ttk.Entry(sf2, textvariable=self.v_score_log)).pack(side="left", fill="x", expand=True, padx=4)
+        lock(ttk.Button(sf2, text="Browse...", command=self.browse_score_log)).pack(side="left", padx=4)
+        ttk.Label(f2, text="CSV of score / ball-in times. When set, those times seed baskets; each is still rim-checked. Leave blank for auto detect.",
+                  foreground="#555").grid(row=6, column=1, columnspan=3, sticky="w", padx=6)
+        of2 = ttk.Frame(f2)
+        of2.grid(row=7, column=1, columnspan=3, sticky="w")
+        lock(ttk.Checkbutton(of2, text="AI review of rim strips (needs API key; off by default, fully offline without it)",
+                             variable=self.v_ai_review)).pack(side="left", padx=4)
         bf = ttk.Frame(f2)
-        bf.grid(row=5, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        bf.grid(row=8, column=0, columnspan=4, sticky="w", pady=(6, 0))
         self.btn_analyze = lock(ttk.Button(bf, text="Find highlights", command=self.start_analyze))
         self.btn_analyze.pack(side="left", padx=6)
         lock(ttk.Button(bf, text="Load clip list...", command=self.load_csv)).pack(side="left", padx=6)
         ttk.Label(bf, text="No GPU? Detection runs on the CPU and can take longer than the video. 'Fast' is quickest.",
                   foreground="#555").pack(side="left", padx=8)
         af = ttk.Frame(f2)
-        af.grid(row=6, column=0, columnspan=4, sticky="w", pady=(4, 0))
+        af.grid(row=9, column=0, columnspan=4, sticky="w", pady=(4, 0))
         lock(ttk.Checkbutton(af, text="Render the video automatically when highlights are found",
                              variable=self.v_autorender, command=self._sync_analyze_button)).pack(side="left", padx=6)
         ttk.Label(af, text="Uses the format, intro, logo, and music in section 4.",
@@ -897,6 +911,13 @@ class App:
             return False
         return True
 
+    def browse_score_log(self):
+        path = self.fd.askopenfilename(
+            title="Score log CSV",
+            filetypes=[("CSV", "*.csv"), ("All files", "*.*")])
+        if path:
+            self.v_score_log.set(path)
+
     def pick_hoops(self):
         if not self._need_info():
             return
@@ -922,11 +943,13 @@ class App:
         job = Job(input_path=inp, output_path=self.output_path(), start=start, end=end, quality=quality,
                   sensitivity=float(self.v_sens.get()), lens_model=self.v_lens.get(),
                   hoops=list(self.hoops),
-                  clip=ClipSettings(pre=float(self.v_pre.get() or 6), post=float(self.v_post.get() or 3),
+                  clip=ClipSettings(pre=float(self.v_pre.get() or 3.5), post=float(self.v_post.get() or 1.0),
                                     include_attempts=self.v_attempts.get(), skip_warmup=self.v_warmup.get(),
                                     max_total=maxlen),
                   perf_mode=self.perf_mode(),
-                  perf_threads=int(self.v_threads.get() or 1) if self.perf_mode() == "custom" else None)
+                  perf_threads=int(self.v_threads.get() or 1) if self.perf_mode() == "custom" else None,
+                  score_log=Path(self.v_score_log.get().strip().strip('"')) if self.v_score_log.get().strip() else None,
+                  ai_review=AIReviewSettings(enabled=bool(self.v_ai_review.get())))
         rs = RenderSettings()
         rs.formats = [f for f, v in (("16:9", self.v_f169), ("9:16", self.v_f916)) if v.get()]
         rs.resolution = self.v_res.get()
@@ -962,6 +985,7 @@ class App:
             quality=next((k for k, v in QUALITY_LABELS.items() if v == self.v_quality.get()), "balanced"),
             sensitivity=float(self.v_sens.get()), pre=self.v_pre.get(), post=self.v_post.get(),
             attempts=self.v_attempts.get(), skip_warmup=self.v_warmup.get(), max_length=self.v_maxlen.get(),
+            score_log=self.v_score_log.get(), ai_review=self.v_ai_review.get(),
             lens_model=self.v_lens.get(), f169=self.v_f169.get(), f916=self.v_f916.get(),
             resolution=self.v_res.get(), crf=self.v_crf.get(), preset=self.v_preset.get(),
             intro=self.v_intro.get(), title_on=self.v_title_on.get(), title_sub=self.v_sub.get(),

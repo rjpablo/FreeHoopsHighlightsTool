@@ -10,7 +10,9 @@ Run without arguments for the window. Command line:
   analyze  -i VIDEO [options]      find highlights, write the CSV files
   render   --data CLIPS.csv        render from the (edited) CSV files
   auto     -i VIDEO [options]      analyze and render in one go
+  eval     --pred CSV --truth CSV  score predictions vs a hand-labelled list
 Use --help on each command for the options.
+See docs/HIGHLIGHT_STRATEGY.md for how made baskets are chosen.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ from fhh_core import (  # noqa: E402
     RenderCancelled, RunLogger, X264_PRESETS, component_issues, default_output_for,
     format_eta, parse_optional_time, parse_time,
 )
+from fhh_ai_review import AIReviewSettings  # noqa: E402
 from fhh_detect import QUALITY, Hoop  # noqa: E402
 from fhh_jobs import Job, analyze, default_title, music_tracks, render  # noqa: E402
 from fhh_project import ClipSettings  # noqa: E402
@@ -86,11 +89,20 @@ def add_analyze(p: argparse.ArgumentParser) -> None:
     p.add_argument("--quality", choices=list(QUALITY), default="balanced")
     p.add_argument("--sensitivity", type=float, default=0.5, help="0 strict .. 1 catch more (more false clips)")
     p.add_argument("--hoops", help="'A:yaw,pitch,width;B:yaw,pitch,width' in degrees; omit to find them automatically")
-    p.add_argument("--pre", type=float, default=6.0, help="seconds before each basket")
-    p.add_argument("--post", type=float, default=3.0, help="seconds after each basket")
+    p.add_argument("--pre", type=float, default=3.5, help="seconds before each basket (default 3.5)")
+    p.add_argument("--post", type=float, default=1.0, help="seconds after each basket (default 1.0; never under 1)")
+    p.add_argument("--max-clip", type=float, default=6.5, help="max seconds per clip so nearby baskets stay separate")
     p.add_argument("--attempts", action="store_true", help="also switch on shots at the rim that were not detected as made")
     p.add_argument("--keep-warmup", action="store_true", help="do not switch off clips during a detected warm-up")
     p.add_argument("--max-length", type=float, default=0.0, help="max seconds of clips, alternating hoops (0 = all)")
+    p.add_argument("--score-log", help="CSV of score / ball-in times (scoreboard path); rim check still runs")
+    p.add_argument("--scoreboard-video", help="optional scoreboard overlay video for change detection")
+    p.add_argument("--scoreboard-region", default="",
+                   help="crop x,y,w,h as frame fractions (or %%); used with --scoreboard-video or the input")
+    p.add_argument("--ai-review", action="store_true",
+                   help="opt-in: send rim strips to a vision API to confirm makes (needs API key; off by default)")
+    p.add_argument("--ai-api-key", default="", help="vision API key (or set OPENAI_API_KEY); unused unless --ai-review")
+    p.add_argument("--ai-model", default="gpt-4o-mini", help="vision model id for --ai-review")
 
 
 def add_render(p: argparse.ArgumentParser) -> None:
@@ -105,8 +117,9 @@ def add_render(p: argparse.ArgumentParser) -> None:
     p.add_argument("--no-title", action="store_true")
     p.add_argument("--no-logo", action="store_true")
     p.add_argument("--music", help="beat1, beat2, a file path, or none (default: beat1)")
-    p.add_argument("--music-volume", type=float, default=0.8)
+    p.add_argument("--music-volume", type=float, default=0.55)
     p.add_argument("--game-volume", type=float, default=0.35, help="game sound level under the music")
+    p.add_argument("--music-lufs", type=float, default=-14.0, help="target loudness of the music mix (LUFS)")
     p.add_argument("--no-nomusic-copy", action="store_true", help="skip the extra no-music copy")
     p.add_argument("--promo", action="append", metavar="START,DURATION",
                    help="lower-third promo card at a time in the OUTPUT video (repeatable), e.g. 0:12,6")
@@ -142,6 +155,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_analyze(b)
     add_render(b)
     add_common(b)
+    e = sub.add_parser("eval", help="compare predicted baskets to a hand-labelled CSV")
+    e.add_argument("--pred", required=True, help="predicted highlights CSV")
+    e.add_argument("--truth", required=True, help="hand-labelled CSV (ball_in / event_time)")
+    e.add_argument("--tolerance", type=float, default=0.75, help="match window in seconds")
+    e.add_argument("--all-rows", action="store_true", help="use all pred rows, not only include=yes")
     return ap
 
 
@@ -158,6 +176,7 @@ def render_settings_from_args(args, title_default: str) -> RenderSettings:
     rs.logo_on = not args.no_logo
     rs.music = resolve_music(args.music)
     rs.music_volume, rs.game_volume = args.music_volume, args.game_volume
+    rs.music_lufs = float(getattr(args, "music_lufs", -14.0) or -14.0)
     rs.no_music_copy = not args.no_nomusic_copy
     rs.lt_on = not args.no_promo
     if args.promo:
@@ -206,8 +225,17 @@ def run_cli(args) -> int:
                       device=args.device, source_kind=args.source_kind,
                       hoops=parse_hoops(args.hoops) if args.hoops else [],
                       clip=ClipSettings(pre=args.pre, post=args.post, include_attempts=args.attempts,
-                                        skip_warmup=not args.keep_warmup, max_total=args.max_length),
-                      perf_mode=args.performance, perf_threads=args.threads, overwrite=args.overwrite)
+                                        skip_warmup=not args.keep_warmup, max_total=args.max_length,
+                                        max_clip=getattr(args, "max_clip", 6.5)),
+                      perf_mode=args.performance, perf_threads=args.threads, overwrite=args.overwrite,
+                      score_log=Path(args.score_log) if getattr(args, "score_log", None) else None,
+                      scoreboard_video=Path(args.scoreboard_video) if getattr(args, "scoreboard_video", None) else None,
+                      scoreboard_region=getattr(args, "scoreboard_region", "") or "",
+                      ai_review=AIReviewSettings(
+                          enabled=bool(getattr(args, "ai_review", False)),
+                          api_key=getattr(args, "ai_api_key", "") or "",
+                          model=getattr(args, "ai_model", "gpt-4o-mini") or "gpt-4o-mini",
+                      ))
             res = analyze(job, ctl, progress, logger)
             if args.cmd == "auto":
                 job.render = render_settings_from_args(args, default_title(res["info"], inp))
@@ -239,6 +267,17 @@ def main(argv=None) -> int:
     if not argv or argv == ["--gui"]:
         from fhh_gui import run_gui
         return run_gui(issues)
+    # eval does not need runtime/assets manifests
+    if argv and argv[0] == "eval":
+        args = build_parser().parse_args(argv)
+        tools = Path(__file__).resolve().parents[1] / "tools"
+        sys.path.insert(0, str(tools))
+        import eval_highlights
+        return eval_highlights.main([
+            "--pred", args.pred, "--truth", args.truth,
+            "--tolerance", str(args.tolerance),
+            *(["--all-rows"] if args.all_rows else []),
+        ])
     if issues:
         for i in issues:
             print("ERROR: " + i, file=sys.stderr)
