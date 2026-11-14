@@ -14,3 +14,11 @@ Most updates only change app\ and ship as a small zip
 3. Run run.bat as usual.
 If an update needs newer runtime or assets, the program says so and asks for
 the full package. If requirements.txt changed, run install.bat once.
+
+v1.2 notes
+----------
+- Stricter made-basket rim verification; warm-up / camera-setup / lone-shooter
+  rejection; shorter default clips (≈3.5 s before, 1 s after).
+- Optional score-log CSV (and scoreboard change detection) for path B.
+- Music mix loudnorm ≈ -14 LUFS; DejaVu fonts and beat1/beat2.m4a are included.
+- See docs\HIGHLIGHT_STRATEGY.md and HANDOFF.md.

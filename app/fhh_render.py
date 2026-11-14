@@ -58,8 +58,9 @@ class RenderSettings:
     title_duration: float = 4.0
     logo_on: bool = True
     music: str = ""                   # path to an audio file, "" = no music
-    music_volume: float = 0.8
+    music_volume: float = 0.55        # lower default; final mix is loudnorm'd to ~-14 LUFS
     game_volume: float = 0.35         # game sound under the music
+    music_lufs: float = -14.0         # target integrated loudness for the music mix
     no_music_copy: bool = True
     lt_on: bool = True
     lt_windows: list[CardWindow] = field(default_factory=lambda: [CardWindow(12.0, 6.0)])
@@ -371,11 +372,14 @@ def assemble(ffmpeg: str, ffprobe: str, segs: list[Path], out_path: Path, nomusi
     if music is not None:
         i_mus = add("-stream_loop", "-1", "-i", str(music))
         fo = min(2.5, main_dur / 3)
+        target_lufs = float(getattr(rs, "music_lufs", -14.0) or -14.0)
         f.append(f"[{i_mus}:a]{fmt},atrim=0:{main_dur:.3f},asetpts=PTS-STARTPTS,"
                  f"afade=t=in:st=0:d=1.5,afade=t=out:st={main_dur - fo:.3f}:d={fo:.3f},"
                  f"volume={rs.music_volume:.3f}[mus]")
         f.append(f"{main_labels[0]}volume={rs.game_volume:.3f}[gduck]")
-        f.append("[gduck][mus]amix=inputs=2:duration=first:normalize=0[amix]")
+        # Mix then loudnorm so the finished music bed lands near -14 LUFS (not ~-10).
+        f.append("[gduck][mus]amix=inputs=2:duration=first:normalize=0,"
+                 f"loudnorm=I={target_lufs:.1f}:TP=-1.5:LRA=11[amix]")
         aparts[0].append("[amix]")
         if want_nm:
             aparts[1].append(main_labels[1])

@@ -201,11 +201,14 @@ def read_keyframes(path: Path) -> list[Keyframe]:
 
 @dataclass
 class ClipSettings:
-    pre: float = 6.0             # seconds before the basket
-    post: float = 3.0            # seconds after
+    # Hand-curated highlights are ~3–5 s, ending ~1 s after the ball goes in.
+    pre: float = 3.5             # seconds before the basket
+    post: float = 1.0            # seconds after (must stay ≥ 1.0 for the rim finish)
     include_attempts: bool = False
     skip_warmup: bool = True
     max_total: float = 0.0       # seconds of clips (0 = no limit)
+    max_clip: float = 6.5        # hard cap so nearby baskets stay separate clips
+    merge_gap: float = 2.2       # only merge same-hoop events closer than this (putbacks)
 
 
 def _ang(a):
@@ -275,46 +278,77 @@ def events_to_clips(events: list[Event], hoops: list[Hoop], cs: ClipSettings,
                     releases: Optional[list] = None,
                     persons: Optional[np.ndarray] = None,
                     rim_cands: Optional[np.ndarray] = None) -> list[Clip]:
+    # Rejected events stay in the list (switched off) so the review step can restore them.
+    active = [(n, e) for n, e in enumerate(events)]
     off_side = other_side_indexes(
-        events, hoops, persons if persons is not None else np.zeros((0, 5)), rim_cands)
+        [e for _, e in active], hoops,
+        persons if persons is not None else np.zeros((0, 5)), rim_cands)
+    # Map off_side indexes (into the filtered list) back — we passed all events in order.
     raw: list[Clip] = []
-    for n, e in enumerate(events):
+    post = max(1.0, float(cs.post))  # never cut sooner than ~1 s after the ball goes in
+    pre = max(1.5, float(cs.pre))
+    max_clip = max(post + 2.0, float(cs.max_clip or 6.5))
+    merge_gap = max(0.5, float(getattr(cs, "merge_gap", 2.2) or 2.2))
+    for n, e in active:
         rel = releases[n] if releases and n < len(releases) else None
-        start = e.time - cs.pre
+        start = e.time - pre
         if rel is not None:
-            start = min(start, rel - 2.0)  # long shots: start well before the release
+            # Long shots: start a little before release, but keep the clip short.
+            start = min(start, max(e.time - max_clip + post, rel - 1.5))
         start = max(range_start, start)
-        end = min(range_end, e.time + cs.post)
+        end = min(range_end, e.time + post)
+        # If the analysis range ends right after the basket, still keep the 1 s finish
+        # when the source has more frames (range_end is the analysis window).
+        if end < e.time + post and range_end >= e.time:
+            end = min(range_end, e.time + post)
+        # Enforce max length by trimming the pre-roll first (keep the finish).
+        if end - start > max_clip:
+            start = max(range_start, end - max_clip)
+        note = e.note
+        if getattr(e, "rejected", False):
+            reason = getattr(e, "reject_reason", "") or "rejected"
+            note = (note + f"; {reason}").strip("; ")
         clip = Clip(id="", start=start, end=end, event_time=e.time, type=e.kind,
                     hoop=hoops[e.hoop].name if e.hoop < len(hoops) else "A",
-                    score=e.score, note=e.note, release=rel)
+                    score=e.score, note=note, release=rel)
         clip.other_side = n in off_side
+        clip.rejected = bool(getattr(e, "rejected", False))
         raw.append(clip)
-    raw.sort(key=lambda c: c.start)
-    # dedupe/merge overlaps
+    raw.sort(key=lambda c: (c.start, c.event_time))
+    # Merge only putbacks / immediate rebounds at the same hoop — never glue a whole
+    # possession of separate makes into a 20 s clip.
     merged: list[Clip] = []
     for c in raw:
         m = next((x for x in reversed(merged)
-                  if x.hoop == c.hoop and c.start < x.end and x.other_side == c.other_side), None)
+                  if x.hoop == c.hoop
+                  and (not getattr(x, "rejected", False)) == (not getattr(c, "rejected", False))
+                  and abs(c.event_time - x.event_time) <= merge_gap
+                  and c.start <= x.end + 0.05
+                  and x.other_side == c.other_side), None)
         if m is not None:
-            # same hoop: one longer clip (e.g. a putback after a miss)
             both_made = m.type == "made" and c.type == "made"
             c_better = (c.type == "made" and m.type != "made") or (c.type == m.type and c.score > m.score)
-            # A real game shot must not stay hidden inside an other-side clip.
-            m.end = max(m.end, c.end)
+            new_end = max(m.end, c.end)
+            new_start = min(m.start, c.start)
+            if new_end - new_start > max_clip * 1.25:
+                # Too long even for a putback sequence: keep as separate clips.
+                merged.append(c)
+                continue
+            m.start, m.end = new_start, new_end
             if c_better:
                 m.type, m.event_time, m.note, m.release = c.type, c.event_time, c.note, c.release
             m.score = max(m.score, c.score)
             if both_made:
-                m.note = (m.note + " (+ another basket)").strip()
+                m.note = (m.note + " (+ putback)").strip()
             continue
-        # The other basket can score at the same time. Keep that shot too.
         merged.append(c)
     for i, c in enumerate(merged, 1):
         c.id = f"c{i:03d}"
         c.order = i
-        c.include = c.type == "made" or (c.type == "attempt" and cs.include_attempts)
-        if cs.skip_warmup and warmup is not None and c.event_time < warmup:
+        c.include = (c.type == "made" or (c.type == "attempt" and cs.include_attempts))
+        if getattr(c, "rejected", False):
+            c.include = False
+        if cs.skip_warmup and warmup is not None and c.event_time < warmup and "warm-up" not in c.note:
             c.include = False
             c.note = (c.note + "; warm-up?").strip("; ")
         if getattr(c, "other_side", False):

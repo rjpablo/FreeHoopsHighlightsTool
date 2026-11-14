@@ -246,17 +246,24 @@ def plan_clip(clip: Clip, d: Detections, hoops: list[Hoop], bystanders: list,
             shooter = (sy, sp)
         elif release is None:
             release = clip.event_time - 1.2
+        # Hold the shooter through release (longer on long shots), then pan to the rim.
+        sep0 = abs(float(wrap180(shooter[0] - hoop.yaw))) if shooter is not None else 0.0
+        long_shot = sep0 > 0.45 * base_hfov
+        hold_shooter = 0.45 if long_shot else 0.25
         for i, t in enumerate(ts):
-            if shooter is not None and t <= release + 0.25:
+            if shooter is not None and t <= release + hold_shooter:
                 sep = abs(float(wrap180(shooter[0] - hoop.yaw)))
-                if sep <= 0.6 * base_hfov:
-                    ty[i] = blend_yaw(shooter[0], hoop.yaw, 0.5)
+                # Keep the shooter in frame: only dual-frame when both fit with margin.
+                if sep <= 0.55 * base_hfov and not long_shot:
+                    ty[i] = blend_yaw(shooter[0], hoop.yaw, 0.45)
                     tp[i] = 0.5 * (shooter[1] + hoop.pitch) - 3
                 else:
-                    ty[i], tp[i] = shooter[0], shooter[1] + 2
+                    # Bias slightly toward the rim so the pan is shorter, but stay on shooter.
+                    ty[i] = blend_yaw(shooter[0], hoop.yaw, 0.85)
+                    tp[i] = shooter[1] + 2
             elif release - 0.5 <= t <= clip.event_time + 1.2:
                 ty[i], tp[i] = hoop.yaw, hoop.pitch - 8
-                if shooter is not None and t <= release + 1.8:
+                if shooter is not None and t <= release + 2.2:
                     fast[i] = True
 
     # smoothing

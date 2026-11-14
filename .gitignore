@@ -12,14 +12,12 @@ models/*.pt
 models/*.part
 *.pt
 
-# Downloaded FFmpeg binaries (gyan.dev) and DejaVu font files
+# Downloaded FFmpeg binaries (gyan.dev). Fonts (DejaVu Sans) are tracked in git.
 runtime/ffmpeg.exe
 runtime/ffprobe.exe
-runtime/fonts/*.ttf
 
-# Beats produced by tools/make_music.py (WAV, then encoded to m4a)
+# Intermediate WAVs from tools/make_music.py (m4a beats are tracked in git)
 assets/music/*.wav
-assets/music/*.m4a
 
 # Files the program writes while it runs
 output/

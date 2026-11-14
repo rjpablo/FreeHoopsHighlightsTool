@@ -14,12 +14,17 @@ from fhh_core import (
     VERSION, PERF_LABELS, JobController, Progress, ProgressCb, RenderCancelled, assets_dir, find_tool,
     format_ts, output_stem_for, priority_name, resolve_threads, work_root,
 )
-from fhh_detect import AnalysisSettings, Detections, Hoop, detect_events, run_analysis, warmup_end
+from fhh_ai_review import AIReviewSettings, review_events_with_ai
+from fhh_detect import (
+    AnalysisSettings, Detections, Hoop, apply_rejection_rules, camera_setup_end,
+    detect_events, events_from_score_times, rank_events, run_analysis, warmup_end,
+)
 from fhh_project import (
     ClipSettings, Project, data_paths, events_to_clips, load_project, read_clips, read_keyframes,
     save_project, sorted_for_render, write_clips, write_keyframes, bystander_cells,
 )
 from fhh_render import RenderSettings, render_all, save_clip_shots
+from fhh_scoreboard import detect_scoreboard_changes, load_score_log, parse_region, sample_scoreboard_region
 from fhh_source import FLAT_HFOV, SourceInfo, detect_source
 
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -42,6 +47,10 @@ class Job:
     perf_mode: str = "balanced"
     perf_threads: Optional[int] = None
     overwrite: bool = False
+    score_log: Optional[Path] = None          # CSV of score / ball-in times
+    scoreboard_video: Optional[Path] = None   # optional overlay video
+    scoreboard_region: str = ""               # x,y,w,h fractions on scoreboard_video or input
+    ai_review: AIReviewSettings = field(default_factory=AIReviewSettings)
 
 
 def default_title(info: Optional[SourceInfo], path: Path) -> str:
@@ -131,9 +140,53 @@ def analyze(job: Job, ctl: JobController, progress: ProgressCb, log: Callable[[s
         log(f"Ignoring {len(by)} spots where people stand still (bench, spectators).")
     warm = warmup_end(d, start) if job.clip.skip_warmup else None
     if warm is not None:
-        log(f"Warm-up detected until about {format_ts(warm)} (several balls in play). "
+        log(f"Warm-up detected until about {format_ts(warm)} "
+            "(several balls and/or lone shooters before the game). "
             "Clips before that are switched off; switch them on in the list if needed.")
-    events = detect_events(d, hoops, job.sensitivity)
+    setup_until = camera_setup_end(d, start)
+    if setup_until is not None:
+        log(f"Treating the start through {format_ts(setup_until)} as camera setup "
+            "(clips there are switched off).")
+
+    score_times: list[float] = []
+    hoop_hints: list[Optional[int]] = []
+    if job.score_log:
+        scored = load_score_log(Path(job.score_log))
+        score_times = [e.time for e in scored]
+        hoop_hints = [e.hoop for e in scored]
+        log(f"Score log: {len(score_times)} score times from {Path(job.score_log).name}")
+    elif job.scoreboard_video or job.scoreboard_region:
+        sb_path = Path(job.scoreboard_video) if job.scoreboard_video else job.input_path
+        region = parse_region(job.scoreboard_region) if job.scoreboard_region else (0.35, 0.02, 0.30, 0.12)
+        try:
+            frames, times = sample_scoreboard_region(
+                ffmpeg, sb_path, start, end, region, fps=2.0, log=log)
+            scored = detect_scoreboard_changes(frames, times)
+            score_times = [e.time for e in scored]
+            hoop_hints = [None] * len(score_times)
+            log(f"Scoreboard changes: {len(score_times)} candidate times")
+        except Exception as exc:
+            log(f"Scoreboard sampling failed ({exc}); falling back to rim-only detection.")
+
+    if score_times:
+        events = events_from_score_times(score_times, d, hoops, job.sensitivity, hoop_hints)
+        log(f"Using scoreboard/score-log path ({len(events)} candidates after rim refine).")
+    else:
+        events = detect_events(d, hoops, job.sensitivity)
+        log(f"Using no-scoreboard path (strategy A): {len(events)} rim candidates.")
+
+    events = apply_rejection_rules(events, d, hoops, warm, setup_until, job.clip.skip_warmup)
+    if job.ai_review and job.ai_review.enabled:
+        log("AI review is enabled; confirming made-basket candidates via vision API "
+            "(requires a network key). Offline rim checks already ran.")
+        # Strips are optional; without pre-rendered rim JPEGs we only log and continue.
+        events = review_events_with_ai(events, {}, job.ai_review, log)
+    events = rank_events(events)
+    rejected = sum(1 for e in events if e.rejected)
+    if rejected:
+        log(f"Rejected {rejected} candidate(s) (setup / warm-up / lone shooter / occlusion). "
+            "They stay in the list switched off.")
+
     P = filter_bystanders(d.persons, by)
     releases = []
     for e in events:
@@ -162,7 +215,11 @@ def analyze(job: Job, ctl: JobController, progress: ProgressCb, log: Callable[[s
     proj = Project(input=str(job.input_path), kind=info.kind, start=start, end=end, hoops=hoops,
                    bystanders=by, warmup_end=warm, detections=str(det_path),
                    settings=dict(quality=job.quality, sensitivity=job.sensitivity, lens_model=job.lens_model,
-                                 pre=job.clip.pre, post=job.clip.post, version=VERSION,
+                                 pre=job.clip.pre, post=job.clip.post, max_clip=job.clip.max_clip,
+                                 version=VERSION,
+                                 score_log=str(job.score_log) if job.score_log else "",
+                                 scoreboard_video=str(job.scoreboard_video) if job.scoreboard_video else "",
+                                 ai_review=bool(job.ai_review.enabled) if job.ai_review else False,
                                  stabilized=info.stab is not None,
                                  lrv=str(info.lrv) if info.lrv else ""))
     save_project(proj, paths["project"])

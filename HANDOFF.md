@@ -1,6 +1,8 @@
-# FreeHoops Highlights Tool v1.0: handoff notes
+# FreeHoops Highlights Tool v1.2: handoff notes
 
 This file is for whoever works on the tool next, such as a local coding agent. The user is rj pablo (FreeHoops, Philippines). He records pickup games with an Insta360 camera on a tripod by the court and posts highlight videos and Shorts to YouTube and TikTok.
+
+**Highlight strategy** (no-scoreboard path A, scoreboard path B, rejection rules, clip timing, evaluation) is documented in `docs/HIGHLIGHT_STRATEGY.md`. Read that before changing detection.
 
 ## 1. Purpose and features
 
@@ -15,7 +17,7 @@ The tool turns a basketball game recording into a highlights video:
 - **Time range.** Optional start and end times (GUI fields, or `--start`/`--end`) limit processing to that part of the video. A blank field means the whole video.
 - **Stitching.** The two fisheye lenses are stitched with rj's fitted Insta360 X4 lens model, with a feathered seam.
 - **Virtual camera.** It follows the play automatically, the same way as rj's earlier "v2 auto-zoom" edits.
-- **Made-basket detection.** It works from close-up "rim views" of each hoop, plus warm-up detection, clip padding, and dedupe/merge.
+- **Made-basket detection.** Broad rim candidates are verified with a downward through-rim / net check. Warm-ups (multi-ball and lone shooters), camera setup, and occlusion are rejected. Optional score-log / scoreboard seeds (path B). Clip padding defaults to ~3.5 s pre / 1 s post; nearby makes are not merged into long clips.
 - **Review step.** Clips can be switched on/off, edited, added, deleted, or previewed in the GUI. The data is also kept in plain CSV files that can be edited in Excel and re-rendered.
 - **Render.** It produces:
   - 16:9 and/or 9:16 (Short) outputs
@@ -46,25 +48,30 @@ FreeHoopsHighlightsTool/
     fhh_source.py            input detection, FFmpeg frame reader, lens models + Stitcher,
                              perspective reprojection, DirectFisheyeView, flat crop camera
     fhh_detect.py            YOLO wrapper, weight download, court-band tiling, rim views,
-                             analysis pass, hoop auto-guess, made-basket events, warm-up detection
+                             analysis pass, hoop auto-guess, rim verification, rejection rules,
+                             warm-up / camera-setup / lone-shooter detection
+    fhh_scoreboard.py        score-log CSV loader, scoreboard-region change detection
+    fhh_ai_review.py         optional vision-API make confirmation (off by default)
     fhh_camera.py            virtual-camera planning (ball/player blend, shooter rule, smoothing),
                              Catmull-Rom keyframe interpolation
     fhh_project.py           Clip/Keyframe/Project data, CSV + JSON I/O, events -> clips,
-                             balanced selection, bystander cells
+                             short-clip defaults, putback-only merge, balanced selection
     fhh_render.py            per-clip render (frames piped to FFmpeg), final assembly
-                             (intro, title, logo, lower thirds, end card, music, no-music copy)
+                             (intro, title, logo, lower thirds, end card, music @ ~-14 LUFS)
     fhh_jobs.py              analyze() and render() jobs used by both GUI and CLI
-    fhh_gui.py               Tkinter window, hoop picker, clip preview
+    fhh_gui.py               Tkinter window, hoop picker, clip preview, score-log field
     graphics.py              card/title/logo rendering with Pillow (from the Promo Tool, extended)
     qrcodegen.py             Nayuki QR generator (MIT)
-  runtime/                   ffmpeg.exe, ffprobe.exe (gyan.dev 9.0.2 full), fonts/, licenses/, manifest.json
+  runtime/                   ffmpeg.exe, ffprobe.exe (gyan.dev 9.0.2 full), fonts/ (DejaVu), licenses/, manifest.json
   assets/                    intro.mov (ProRes 4444 alpha, 6.8 s), intro_audio.wav, logo.png,
-                             music/*.m4a, calibration/insta360_x4.json, manifest.json
+                             music/*.m4a (tracked), calibration/insta360_x4.json, manifest.json
   models/                    yolov8n.pt, yolov8s.pt (bundled); yolov8m/x downloaded on first use;
                              optional hoop.pt (any YOLO model with a "hoop"/"rim" class)
+  docs/HIGHLIGHT_STRATEGY.md detection / clip strategy and evaluation notes
+  tests/                     unit tests + fixtures/clip_list_v2.csv (Nov 12 hand labels)
+  tools/                     make_music.py, eval_highlights.py
   output/, logs/, work/      created at run time (work/<name>/detections.npz = detection cache)
   FreeHoopsHighlightsTool.settings.json   remembered GUI settings and output folder
-  tools/                     make_music.py (how the bundled beats were generated)
 ```
 
 The program checks the manifest versions at start-up (`component_issues()` in `fhh_core.py`). If `runtime/` or `assets/` is older than the app requires, it tells the user to unzip the full package.
@@ -97,19 +104,15 @@ One decode of the chosen range at the analysis fps (quality preset):
 - **Full-court pass.** COCO person (0) and sports ball (32) are detected at conf 0.1 on square tiles over the court band (-35°..+25°), with wrap-around. This matches the v2 pipeline (which used YOLOv8x at conf 0.1). Detections become scene coordinates (yaw/pitch degrees).
 - **Rim views.** On every analysis frame, a perspective close-up of each hoop is made (FOV ≈ 11 rim widths, with the rim slightly below centre). Frame differencing gives motion, and nothing is run when nothing moves near the rim. When something does move, YOLO looks for the ball (conf 0.08–0.18 depending on sensitivity). Motion blobs of ball size count as weak candidates. Net-zone motion energy is recorded.
 - **Hoops.** The best source is the user picking them (left and right rim edges give the centre and apparent width). Next is `models/hoop.pt` if present. The last resort is a rough guess from where balls are seen most above head height.
-- **Made basket** (`detect_events`). A candidate *above* the rim (|dx|<1.6, -4.5<dy<-0.35, in rim widths) must be followed within 0.9 s by a candidate *through* the rim (|dx|<0.55, -0.3<dy<1.7).
-  - Score = 0.45·above + 0.45·through + net-motion bonus (0.25) − "beside the rim" penalty + 0.1.
-  - Thresholds depend on sensitivity: made ≥ 0.62−0.3·s, attempt ≥ 0.45−0.2·s.
-  - A descending ball above the rim with no "through" counts as an "attempt".
-  - Events at the same hoop within 2.5 s are deduped.
-- **Warm-up.** In 30 s windows, if 20% or more of the full-court frames show 2 or more distinct balls, it counts as shootaround. Clips before the end of that run are switched off (but kept in the list).
+- **Made basket** (`detect_events` / `verify_rim_make`). Broad seeds (above/through/net spikes) are verified: downward path above → through rim → into net (or net-motion spike). Roll-outs after “through” are rejected. Scoreboard path uses `events_from_score_times` then the same rim check.
+- **Rejection.** Camera setup (early empty / huge person / first ~2.5 s), warm-ups (multi-ball and lone shooters before a 5+ person game), occlusion, and other-side-of-court. Rejected events stay in the CSV switched off.
 - **Bystanders.** Grid cells (3°) occupied in 45% or more of frames are treated as bench/spectators and ignored by the camera.
 - The detection cache is `work/<output name>/detections.npz`. The render uses it to plan cameras for clips added by hand.
 
 ### 3.3 Clips (`fhh_project.py`)
-- Each event becomes a clip from `event − pre` (default 6 s) to `event + post` (default 3 s). If the release was estimated, the clip starts at `release − 2 s` or earlier, so long shots show the shooter.
-- **Overlaps.** Overlaps at the same hoop are merged into one longer clip. Heavy overlaps across hoops keep the stronger clip, and small ones are trimmed at the midpoint.
-- Made baskets are switched on. Attempts are switched on only with the setting.
+- Each event becomes a clip from `event − pre` (default **3.5 s**) to `event + post` (default **1.0 s**, never less). Cap ~6.5 s per clip.
+- **Merges.** Same-hoop events merge only within ~2.2 s (putbacks). Separate makes a few seconds apart stay separate clips (fixes the old 20+ s merges).
+- Made baskets are switched on. Attempts / rejected / warm-up / other-side are switched off but kept for review.
 - "Max total" picks the best clips round-robin across hoops, so both ends of the court get mixed in. The render order is `order`, then `start`.
 
 ### 3.4 Virtual camera (`fhh_camera.py`): rj's v2 rules
@@ -140,7 +143,7 @@ One decode of the chosen range at the analysis fps (quality preset):
    - intro: the plate (dark plus orange bars) with the transparent `intro.mov` scaled to fit, plus `intro_audio.wav`
    - all clips through the concat demuxer, plus the end card when it is "at end"
    - overlays: logo (during the clips only), title (fade in 0.4 s, hold, fade out 1 s), each lower-third window (0.4 s alpha fades), and the end card when it is "at a time"
-   - audio: game sound ducked to 0.35 with music at 0.8 (1.5 s fade in, 2.5 s fade out, looped to length)
+   - audio: game sound ducked to 0.35 with music at ~0.55, then `loudnorm` to about **-14 LUFS** (1.5 s fade in, 2.5 s fade out, looped to length)
    - when needed, a second audio-only output without music; it is remuxed with `-c copy` into `_nomusic.mp4`, so the video isn't encoded twice
 3. **Output size.** "auto" gives:
    - 1080p for 360 sources (1440p for ≥ 3800 px lenses or 8K equirect)
@@ -181,28 +184,30 @@ For development on Linux/macOS: `python3 -m venv .venv && .venv/bin/pip install 
 
 ## 7. Known limitations, untested areas, next steps
 
-**Testing status.** v1.0 was written without running it. At rj's request there was no end-to-end run, no GUI test, and no screenshots. Only `python -m py_compile` and pyflakes were run. Expect first-run bugs; check the log file in `logs/`.
+**Testing status.** v1.2 adds unit tests (`tests/test_highlight_logic.py`) and `tools/eval_highlights.py` with the Nov 12 hand-labelled fixture. There is still **no access to rj’s game footage** in this environment, so end-to-end detection on real .insv / scoreboard overlay video must be verified on his PC. Check the log file in `logs/`.
 
-**Untested areas**
-- Everything on Windows: install.bat with Python 3.14 (PyTorch must have 3.14 wheels; the fallback is a 3.12/3.13 venv), the CUDA detection, Pause (NtSuspendProcess) and priority, and the Tk layout on a laptop screen.
-- **Stitching at 1920 px lenses.** The X4 calibration was fitted on 2880 px lenses and scaled. If seams look doubled or bent, adjust `scale_adjust` (0.98–1.02) in the calibration JSON or switch Lens model to "generic". A proper fix is to read the per-file calibration from the .insv trailer (the `insta360-rs` crate was used earlier in /workspace/quoted_cafe/ext).
-- Split `_00_`/`_10_` pairs and side-by-side single-stream files (lens order and orientation assumed).
-- 9:16 framing. Keyframes are planned for the 85° view and reused with a 52° view, so the shooter-and-rim framing may need a portrait-specific plan.
+**Untested areas (need real footage)**
+- Full analyze on .insv / flat 1080p games (false positives at t=0, warm-ups, rim roll-outs).
+- Scoreboard overlay change detection on a real scoreboard crop.
+- AI review against a live API key.
+- Everything on Windows: install.bat with Python 3.14, CUDA, Pause, Tk layout.
+- **Stitching at 1920 px lenses.** The X4 calibration was fitted on 2880 px lenses and scaled.
+- Split `_00_`/`_10_` pairs and side-by-side single-stream files.
+- 9:16 framing (portrait-specific shooter/rim plan).
 
-**Expected detection accuracy (estimate, not measured)**
-- Made-basket detection depends on the ball being visible in the rim view. With picked hoops and a clear view, expect many but not all makes. Expect false clips from dunks, net touches, rebounds above the rim, and players walking under the hoop. Swishes with heavy motion blur may be missed.
-- The earlier v2 pipeline only "locked" the ball in about 6–8% of full-court frames, so the camera often follows the players more than the ball.
-- The review step exists for these reasons.
-- The automatic hoop guess is rough. Picking hoops is strongly recommended.
+**Expected detection accuracy (estimate, not measured on real video)**
+- Rim verification is stricter than v1.0/v1.1; expect fewer roll-out false makes and fewer setup/warm-up clips, at the cost of some missed swishes with heavy blur.
+- Score-log path should track the Nov 12 list closely once times are fed in and rim views are clear.
+- The review step remains essential. Picking hoops is strongly recommended.
 
 **Performance.** On CPU only, detection on Balanced may take about as long as the video, or longer. Fast is about 2–3× quicker. The render is about 3–8 fps of output on a laptop CPU at 1080p.
 
-**Music.** The two bundled beats are simple procedurally generated tracks (safe to use, but basic). A YouTube Audio Library track can be picked with "Custom file…".
+**Music.** Bundled beats are tracked in `assets/music/*.m4a` (regenerate with `tools/make_music.py`). Mix targets ~-14 LUFS.
 
 **Suggested next steps**
-1. Run on one real game and tune the detection thresholds (`detect_events`) and rim-view zones against a hand-labelled list of makes.
-2. Train or fine-tune a small YOLO model on rj's footage (ball + rim classes) and drop it in as `models/hoop.pt` (and use its ball class in rim views).
-3. Read the Insta360 per-file calibration (gyro/offset string in the .insv trailer) instead of the fixed X4 fit, and use gyro data for horizon levelling.
-4. Plan a portrait-specific camera path for 9:16.
-5. Add "plays" beyond made baskets (blocks, steals, and-ones) using player-speed/audio peaks.
-6. Add GPU decode (`-hwaccel cuda`/`d3d11va`) and an optional GPU remap to speed up the render.
+1. Run analyze on a real game; score with `run.bat eval --pred ... --truth ...` against a hand-labelled CSV; tune sensitivity / rim zones.
+2. Train or fine-tune a small YOLO model on rj's footage (ball + rim) as `models/hoop.pt`.
+3. Read the Insta360 per-file calibration from the .insv trailer; use gyro for horizon levelling.
+4. Portrait-specific camera path for 9:16.
+5. Optional standout-move extras (crossovers, steals) as `type=play`.
+6. GPU decode (`-hwaccel cuda`/`d3d11va`) and optional GPU remap.
