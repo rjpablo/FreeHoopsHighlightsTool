@@ -18,7 +18,7 @@ from fhh_core import (
     saved_output_dir, unique_name,
 )
 from fhh_detect import QUALITY, QUALITY_LABELS, Hoop, estimate_rim_width
-from fhh_jobs import Job, analyze, default_title, music_tracks, render
+from fhh_jobs import Job, analyze, default_title, music_tracks, render, shots_dir_for
 from fhh_project import (
     Clip, ClipSettings, data_paths, load_project, read_clips, read_keyframes, write_clips,
 )
@@ -272,10 +272,19 @@ class App:
         for text, cmd in (("On / off", self.toggle_clips), ("Edit...", self.edit_clip), ("Add clip...", self.add_clip),
                           ("Delete", self.delete_clips), ("Preview frame...", self.preview_clip),
                           ("Open CSV", self.open_csv), ("Open camera CSV", self.open_camera_csv),
-                          ("Reload CSV", self.reload_csv)):
+                          ("Open screenshots", self.open_shots), ("Reload CSV", self.reload_csv)):
             lock(ttk.Button(cb, text=text, command=cmd)).pack(side="left", padx=3)
         self.v_clipsum = tk.StringVar(value="No clips yet.")
         ttk.Label(f3, textvariable=self.v_clipsum, foreground="#555").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        self.shot_canvas = tk.Canvas(f3, height=112, background="#1a1a1a", highlightthickness=0)
+        self.shot_canvas.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        self.shot_scroll = ttk.Scrollbar(f3, orient="horizontal", command=self.shot_canvas.xview)
+        self.shot_scroll.grid(row=4, column=0, sticky="ew")
+        self.shot_canvas.configure(xscrollcommand=self.shot_scroll.set)
+        self.shot_canvas.bind("<Button-1>", self._shot_click)
+        self._shot_photos: list = []
+        self._shot_hits: list = []
+        self.tree.bind("<<TreeviewSelect>>", lambda _e: self._refresh_shots())
 
         # --- 4. Output
         f4 = ttk.LabelFrame(frm, text="4. Output", padding=8)
@@ -682,6 +691,7 @@ class App:
         self.v_clipsum.set(f"{len(self.clips)} clips, {len(on)} on ({sum(c.duration for c in on):.0f} s"
                            + (f", hoops {', '.join(hoops)}" if hoops else "") + ")."
                            + (f"   File: {self.data_path}" if self.data_path else ""))
+        self._refresh_shots()
 
     def save_clips(self):
         if self.data_path is None:
@@ -776,6 +786,62 @@ class App:
         ttk.Button(bf, text="Cancel", command=d.destroy).pack(side="left", padx=6)
         self.root.wait_window(d)
         return result["ok"]
+
+    def _refresh_shots(self):
+        canvas = self.shot_canvas
+        canvas.delete("all")
+        self._shot_photos = []
+        self._shot_hits = []
+        if not self.clips:
+            canvas.create_text(8, 56, anchor="w", fill="#888",
+                               text="Screenshots of each basket show up here after highlights are found.")
+            canvas.configure(scrollregion=(0, 0, 1, 112))
+            return
+        folder = shots_dir_for(self.data_path.with_suffix(".mp4")) if self.data_path else None
+        try:
+            from PIL import Image, ImageTk
+        except ImportError:
+            canvas.create_text(8, 56, anchor="w", fill="#888", text="Install Pillow to see the screenshots.")
+            return
+        selected = set(self.tree.selection()) if self.tree.winfo_exists() else set()
+        x = 8
+        thumb_w, thumb_h = 160, 90
+        for clip in self.clips:
+            path = folder / f"{clip.id}.jpg" if folder else None
+            if path is not None and path.is_file():
+                with Image.open(path) as src:
+                    img = src.convert("RGB")
+                img.thumbnail((thumb_w, thumb_h))
+                photo = ImageTk.PhotoImage(img)
+                self._shot_photos.append(photo)
+                canvas.create_image(x, 6, image=photo, anchor="nw")
+            else:
+                canvas.create_rectangle(x, 6, x + thumb_w, 6 + thumb_h, fill="#333", outline="")
+                canvas.create_text(x + thumb_w / 2, 6 + thumb_h / 2, text="no shot", fill="#888")
+            if not clip.include:
+                canvas.create_rectangle(x, 6, x + thumb_w, 6 + thumb_h, fill="#000", stipple="gray50", outline="")
+                canvas.create_text(x + 4, 8, anchor="nw", fill="#ff8c28", text=f"{clip.id} off")
+            color = "#ff8c28" if clip.id in selected else ("#6a6a6a" if clip.include else "#444")
+            canvas.create_rectangle(x - 2, 4, x + thumb_w + 2, 8 + thumb_h, outline=color,
+                                    width=3 if clip.id in selected else 1)
+            self._shot_hits.append((x, x + thumb_w, clip.id))
+            x += thumb_w + 10
+        canvas.configure(scrollregion=(0, 0, max(x, 1), 112))
+
+    def _shot_click(self, event):
+        x = self.shot_canvas.canvasx(event.x)
+        for left, right, cid in self._shot_hits:
+            if left <= x <= right and self.tree.exists(cid):
+                self.tree.selection_set(cid)
+                self.tree.see(cid)
+                self.tree.focus(cid)
+                return
+
+    def open_shots(self):
+        if self.data_path is None:
+            self.mb.showinfo(APP_NAME, "Find highlights (or load a clip list) first.")
+            return
+        self._safe(open_folder, shots_dir_for(self.data_path.with_suffix(".mp4")))
 
     def open_csv(self):
         if self.data_path:

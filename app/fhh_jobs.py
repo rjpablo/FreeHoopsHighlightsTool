@@ -11,7 +11,7 @@ from typing import Callable, Optional
 
 from fhh_camera import BASE_HFOV_169, FLAT_ZOOM_169, estimate_release, filter_bystanders, plan_clip
 from fhh_core import (
-    VERSION, PERF_LABELS, JobController, Progress, ProgressCb, assets_dir, find_tool,
+    VERSION, PERF_LABELS, JobController, Progress, ProgressCb, RenderCancelled, assets_dir, find_tool,
     format_ts, output_stem_for, priority_name, resolve_threads, work_root,
 )
 from fhh_detect import AnalysisSettings, Detections, Hoop, detect_events, run_analysis, warmup_end
@@ -19,7 +19,7 @@ from fhh_project import (
     ClipSettings, Project, data_paths, events_to_clips, load_project, read_clips, read_keyframes,
     save_project, sorted_for_render, write_clips, write_keyframes, bystander_cells,
 )
-from fhh_render import RenderSettings, render_all
+from fhh_render import RenderSettings, render_all, save_clip_shots
 from fhh_source import FLAT_HFOV, SourceInfo, detect_source
 
 MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -85,6 +85,11 @@ def work_dir_for(output_path: Path) -> Path:
     return d
 
 
+def shots_dir_for(output_path: Path) -> Path:
+    """Folder of one still per clip, named like the clip id."""
+    return work_root() / Path(output_path).stem / "shots"
+
+
 def _use_performance(job: Job, ctl: JobController, log: Callable[[str], None]) -> None:
     """Set priority and thread count. The window can change both while a run continues."""
     threads = resolve_threads(job.perf_mode, job.perf_threads)
@@ -145,6 +150,15 @@ def analyze(job: Job, ctl: JobController, progress: ProgressCb, log: Callable[[s
     job.output_path.parent.mkdir(parents=True, exist_ok=True)
     write_clips(clips, paths["clips"])
     write_keyframes(keys, paths["camera"])
+    shot_dir = work / "shots"
+    try:
+        n_shots = save_clip_shots(ffmpeg, info, clips, keys, hoops, job.lens_model, shot_dir, ctl, log)
+        if n_shots:
+            log(f"Screenshots of each basket: {shot_dir}")
+    except RenderCancelled:
+        raise
+    except Exception as exc:
+        log(f"Could not save screenshots: {exc}")
     proj = Project(input=str(job.input_path), kind=info.kind, start=start, end=end, hoops=hoops,
                    bystanders=by, warmup_end=warm, detections=str(det_path),
                    settings=dict(quality=job.quality, sensitivity=job.sensitivity, lens_model=job.lens_model,

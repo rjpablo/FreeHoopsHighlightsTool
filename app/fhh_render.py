@@ -23,12 +23,12 @@ from fhh_camera import (
     BASE_HFOV_169, BASE_HFOV_916, FLAT_ZOOM_169, animated_zoom, camera_at, plan_clip, zooms_are_flat,
 )
 from fhh_core import (
-    JobController, Progress, assets_dir, even, ffmpeg_threads_args, fonts_dir, format_ts,
+    JobController, Progress, RenderCancelled, assets_dir, even, ffmpeg_threads_args, fonts_dir, format_ts,
     popen_kwargs, probe_duration, run_ffmpeg_progress, summarize_ffmpeg, x264_args,
 )
 from fhh_detect import Detections, Hoop
 from fhh_project import Clip, Keyframe
-from fhh_source import FLAT_HFOV, ClipRenderer, FrameReader, SourceInfo, decode_plan
+from fhh_source import FLAT_HFOV, ClipRenderer, FrameReader, SourceInfo, base_filter, decode_plan, grab_frame_raw
 from graphics import (
     DEFAULT_QR_URL, END_SUB, END_TITLE, HL_SUB, LT_SUB, LT_TITLE, QR_CAPTION,
     render_highlight_graphics,
@@ -101,6 +101,49 @@ def base_hfov(fmt: str, info: SourceInfo) -> float:
             return FLAT_HFOV * (info.height * 9 / 16) / info.width
         return FLAT_HFOV / FLAT_ZOOM_169
     return BASE_HFOV_916 if fmt == "9:16" else BASE_HFOV_169
+
+
+def save_clip_shots(ffmpeg: str, info: SourceInfo, clips: list[Clip], keys: list[Keyframe],
+                    hoops: list[Hoop], lens_model: str, dest: Path,
+                    ctl: JobController, log: Callable[[str], None]) -> int:
+    """One still per clip, framed the way the highlight will show the basket."""
+    import cv2
+    dest.mkdir(parents=True, exist_ok=True)
+    for old in dest.glob("*.jpg"):
+        old.unlink()
+    if not clips:
+        return 0
+    by_id: dict[str, list[Keyframe]] = {}
+    for key in keys:
+        by_id.setdefault(key.clip_id, []).append(key)
+    plan = decode_plan(info, max_lens=960, max_width=1280)
+    graph = base_filter(info)
+    native = (2 * info.lens_size, info.lens_size) if info.is_fisheye else (info.width, info.height)
+    if (plan.width, plan.height) != native:
+        graph += f",scale={plan.width}:{plan.height}:flags=area"
+    files = info.files if info.kind == "split" else info.files[:1]
+    renderer = ClipRenderer(info, plan, lens_model)
+    saved = 0
+    for i, clip in enumerate(clips, 1):
+        ctl.checkpoint()
+        try:
+            t = float(clip.event_time)
+            ck = sorted(by_id.get(clip.id) or _fallback_keys(clip, hoops), key=lambda k: k.time)
+            frame = grab_frame_raw(ffmpeg, files, t, graph, plan.width, plan.height)
+            yaw, pitch, zoom = camera_at(ck, t)
+            if zooms_are_flat(ck):
+                zoom = animated_zoom(t, clip, info.kind == "flat")
+            view = renderer.view(frame, yaw, pitch, base_hfov("16:9", info) / max(zoom, 0.5), 640, 360, t)
+            label = f"{clip.id}  {format_ts(t)}  hoop {clip.hoop}"
+            cv2.putText(view, label, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 140, 255), 2, cv2.LINE_AA)
+            cv2.imwrite(str(dest / f"{clip.id}.jpg"), view, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            saved += 1
+            log(f"Screenshot {i}/{len(clips)}: {clip.id} at {format_ts(t)}")
+        except RenderCancelled:
+            raise
+        except Exception as exc:
+            log(f"Screenshot {i}/{len(clips)} ({clip.id}) failed: {exc}")
+    return saved
 
 
 def _fallback_keys(clip: Clip, hoops: list[Hoop]) -> list[Keyframe]:
